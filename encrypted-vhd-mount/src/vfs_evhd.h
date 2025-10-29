@@ -13,6 +13,7 @@ struct MountConfig {
   std::wstring encryptedFilePath;
   std::wstring password;
   std::wstring exposedFileName; // e.g. decrypted.vhd
+  std::wstring keyFilePath;     // optional key file
 };
 
 class MountContext {

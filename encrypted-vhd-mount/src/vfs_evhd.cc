@@ -13,7 +13,8 @@ namespace vfs_evhd {
 bool MountContext::setup(const MountConfig &cfg) {
   m_cfg = cfg;
   std::wcerr << L"[vfs] MountContext.setup enc=" << cfg.encryptedFilePath << L"\n";
-  bool ok = m_container.openEncrypted(cfg.encryptedFilePath, cfg.password);
+  std::wcerr << L"[vfs] keyfile=" << (cfg.keyFilePath.empty() ? L"(none)" : cfg.keyFilePath) << L"\n";
+  bool ok = m_container.openEncrypted(cfg.encryptedFilePath, cfg.password, cfg.keyFilePath);
   std::wcerr << L"[vfs] openEncrypted result=" << (ok ? L"ok" : L"fail") << L"\n";
   if (ok) {
     // If container carries original filename metadata, expose it

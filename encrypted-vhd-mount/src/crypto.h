@@ -13,6 +13,8 @@ public:
     std::vector<uint8_t> salt;      // 16 bytes
     std::vector<uint8_t> nonce;     // 16 bytes (CTR IV base)
     uint32_t iterations;            // PBKDF2 iterations
+    uint32_t kdfMethod;             // see evhd::KdfMethod
+    std::wstring keyFilePath;       // optional key file path
   };
 
   CryptoContext();
@@ -27,8 +29,8 @@ public:
   bool isReady() const { return m_ready; }
 
 private:
-  bool deriveKey(const std::wstring &password, const std::vector<uint8_t> &salt,
-                 uint32_t iterations, std::vector<uint8_t> &keyOut);
+  bool deriveKey(const std::wstring &password, const Params &params,
+                 std::vector<uint8_t> &keyOut);
 
   bool aesCtrCrypt(uint64_t fileOffset, uint8_t *buffer, size_t length);
 

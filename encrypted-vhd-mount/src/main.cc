@@ -20,18 +20,21 @@ struct Parameters {
   std::wstring initVhdPath; // if provided, create encrypted from plain VHD
   bool debugMode{false};
   bool launchMountPath{false};
+  std::wstring keyFilePath; // optional key file
 };
 
 static void showUsage() {
   std::wcout << L"encrypted-vhd-mount 用于以AES-256-CTR加密VHD并通过Dokan直接挂载解密视图\n";
   std::wcout << L"用法:\n";
   std::wcout << L"  encrypted-vhd-mount.exe [/d|/l] /p <password> <enc_file> <mount_path>\n";
+  std::wcout << L"  可选: /k <keyfile> 使用密钥文件参与派生\n";
   std::wcout << L"  初始化加密:\n";
   std::wcout << L"  encrypted-vhd-mount.exe /init <plain_vhd> /o <enc_file> /p <password>\n";
   std::wcout << L"参数:\n";
   std::wcout << L"  /d           在控制台显示Dokan调试输出\n";
   std::wcout << L"  /l           挂载后打开资源管理器到挂载路径\n";
   std::wcout << L"  /p           文本密码\n";
+  std::wcout << L"  /k           密钥文件路径\n";
   std::wcout << L"  /init        输入明文VHD进行加密初始化\n";
   std::wcout << L"  /o           输出加密文件路径\n";
 }
@@ -43,6 +46,7 @@ static bool readParameters(Parameters &params, int argc, wchar_t **argv) {
     else if (arg == L"/d" || arg == L"--debug") { params.debugMode = true; }
     else if (arg == L"/l" || arg == L"--launch") { params.launchMountPath = true; }
     else if (arg == L"/p" || arg == L"--password") { if (i + 1 >= argc) { std::wcout << L"缺少密码\n"; return false; } params.password = argv[++i]; }
+    else if (arg == L"/k" || arg == L"--keyfile") { if (i + 1 >= argc) { std::wcout << L"缺少密钥文件路径\n"; return false; } params.keyFilePath = argv[++i]; }
     else if (arg == L"/init") { if (i + 1 >= argc) { std::wcout << L"缺少plain_vhd路径\n"; return false; } params.initVhdPath = argv[++i]; }
     else if (arg == L"/o" || arg == L"--output") { if (i + 1 >= argc) { std::wcout << L"缺少输出文件路径\n"; return false; } params.encFilePath = argv[++i]; }
     else {
@@ -52,13 +56,12 @@ static bool readParameters(Parameters &params, int argc, wchar_t **argv) {
   }
 
   if (!params.initVhdPath.empty()) {
-    if (params.encFilePath.empty() || params.password.empty()) {
-      std::wcout << L"初始化模式需要 /o <enc_file> 与 /p <password>\n"; return false;
-    }
+    if (params.encFilePath.empty()) { std::wcout << L"初始化模式需要 /o <enc_file>\n"; return false; }
+    if (params.password.empty() && params.keyFilePath.empty()) { std::wcout << L"初始化模式需要 /p <password> 或 /k <keyfile>\n"; return false; }
     return true;
   }
 
-  if (params.password.empty()) { std::wcout << L"缺少 /p <password>\n"; return false; }
+  if (params.password.empty() && params.keyFilePath.empty()) { std::wcout << L"缺少 /p <password> 或 /k <keyfile>\n"; return false; }
   if (params.encFilePath.empty()) { std::wcout << L"缺少 <enc_file>\n"; return false; }
   if (params.mountPoint.empty()) { std::wcout << L"缺少 <mount_path>\n"; return false; }
   return true;
@@ -90,11 +93,12 @@ int wmain(int argc, wchar_t **argv) {
 
   std::wcout << L"[main] args parsed. debug=" << (params.debugMode ? L"on" : L"off")
              << L" initVhdPath=" << (params.initVhdPath.empty() ? L"(none)" : params.initVhdPath)
-             << L" encFilePath=" << params.encFilePath << L" mountPoint=" << params.mountPoint << L"\n";
+             << L" encFilePath=" << params.encFilePath << L" mountPoint=" << params.mountPoint
+             << L" keyFilePath=" << (params.keyFilePath.empty() ? L"(none)" : params.keyFilePath) << L"\n";
 
   if (!params.initVhdPath.empty()) {
     evhd::Container c;
-    if (!c.createFromPlainVhd(params.initVhdPath, params.encFilePath, params.password)) {
+    if (!c.createFromPlainVhd(params.initVhdPath, params.encFilePath, params.password, params.keyFilePath)) {
       std::wcout << L"初始化加密失败\n"; return 1;
     }
     std::wcout << L"已生成加密文件: " << params.encFilePath << L"\n";
@@ -105,6 +109,7 @@ int wmain(int argc, wchar_t **argv) {
   cfg.encryptedFilePath = params.encFilePath;
   cfg.password = params.password;
   cfg.exposedFileName = L"decrypted.vhd";
+  cfg.keyFilePath = params.keyFilePath;
 
   vfs_evhd::MountContext mountCtx;
   std::wcout << L"[main] opening encrypted: " << cfg.encryptedFilePath << L"\n";

@@ -3,3 +3,7 @@ out
 build
 encrypted-vhd-mount\build
 testvhd
+small-key.evhd
+small.vhd
+small-pk.evhd
+test.key
