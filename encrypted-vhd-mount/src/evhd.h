@@ -31,6 +31,13 @@ struct Header {
   uint32_t kdfMethod;      // since version 3
 };
 
+// 逻辑->物理重定位条目：将明文视图中的某段（逻辑偏移）剪切到尾部（物理偏移）
+struct RelocEntry {
+  uint64_t logicalOffset;  // 在原始VHD视图中的起始偏移（字节）
+  uint64_t length;         // 被剪切的长度（字节，尽量对齐到512）
+  uint64_t physicalOffset; // 在密文负载中的真实存放偏移（字节），通常 originalSize + ...
+};
+
 class Container {
 public:
   Container() = default;
@@ -45,16 +52,25 @@ public:
   bool readPlain(uint64_t offset, uint8_t *buffer, size_t length);
   bool writePlain(uint64_t offset, const uint8_t *buffer, size_t length);
 
+  void setDebug(bool on) { m_debug = on; }
+
   uint64_t plaintextSize() const { return m_header.originalSize; }
   std::wstring underlyingPath() const { return m_path; }
   uint64_t payloadOffset() const { return m_payloadOffset; }
   std::wstring originalName() const { return m_originalName; }
+
+  const std::vector<RelocEntry> &relocations() const { return m_relocations; }
 
   void close();
 
 private:
   bool readHeader();
   bool writeHeader();
+  // 读取/写入时将逻辑范围拆分为一个或多个物理片段（考虑重定位覆盖）
+  void mapLogicalToPhysical(uint64_t logicalOffset, size_t length,
+                            std::vector<RelocEntry> &outSegments) const;
+  // 打开时完整性校验：验证剪切区域在主负载中的伪随机填充是否匹配头部指纹
+  bool verifyIntegrity();
 
 private:
   std::wstring m_path;
@@ -63,8 +79,13 @@ private:
   std::mutex m_mutex;
   CryptoContext m_crypto;
   bool m_ready{false};
+  bool m_debug{false};
   uint64_t m_payloadOffset{sizeof(Header)};
   std::wstring m_originalName; // exposed file name in mount
+  std::vector<RelocEntry> m_relocations; // v4: 分区表等剪切后的重定位条目
+  // v4 扩展：剪切填充指纹与盐（用于生成伪随机填充）
+  uint8_t m_padSalt[16]{};
+  uint32_t m_padCRC32{0};
 };
 
 } // namespace evhd

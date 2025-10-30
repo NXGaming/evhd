@@ -110,6 +110,7 @@ int wmain(int argc, wchar_t **argv) {
   cfg.password = params.password;
   cfg.exposedFileName = L"decrypted.vhd";
   cfg.keyFilePath = params.keyFilePath;
+  cfg.debug = params.debugMode;
 
   vfs_evhd::MountContext mountCtx;
   std::wcout << L"[main] opening encrypted: " << cfg.encryptedFilePath << L"\n";
@@ -119,6 +120,7 @@ int wmain(int argc, wchar_t **argv) {
   }
 
   std::wcout << L"[main] encrypted opened. plaintext size=" << mountCtx.container().plaintextSize() << L" bytes\n";
+  std::wcout << L"[main] exposing file name: " << mountCtx.config().exposedFileName << L"\n";
 
   DokanInit();
 

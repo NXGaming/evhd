@@ -7,6 +7,8 @@
 #include <filesystem>
 #include <string>
 #include <iostream>
+#define NOMINMAX
+#include <Windows.h>
 
 namespace vfs_evhd {
 
@@ -17,6 +19,7 @@ bool MountContext::setup(const MountConfig &cfg) {
   bool ok = m_container.openEncrypted(cfg.encryptedFilePath, cfg.password, cfg.keyFilePath);
   std::wcerr << L"[vfs] openEncrypted result=" << (ok ? L"ok" : L"fail") << L"\n";
   if (ok) {
+    m_container.setDebug(cfg.debug);
     // If container carries original filename metadata, expose it
     if (!m_container.originalName().empty()) {
       m_cfg.exposedFileName = m_container.originalName();
@@ -199,8 +202,10 @@ static NTSTATUS DOKAN_CALLBACK getvolumeinformation(LPWSTR volumename_buffer, DW
   wcsncpy_s(volumename_buffer, volumename_size, vn.c_str(), _TRUNCATE);
   *volume_serialnumber = 0xE1E4D001;
   *maximum_component_length = 255;
-  *filesystem_flags = FILE_CASE_SENSITIVE_SEARCH | FILE_CASE_PRESERVED_NAMES | FILE_SUPPORTS_REPARSE_POINTS;
-  std::wstring fsn = L"EVHDFS";
+  // 更贴近 Windows 期望的卷能力：保留大小写、支持重解析点与稀疏文件
+  *filesystem_flags = FILE_CASE_PRESERVED_NAMES | FILE_SUPPORTS_REPARSE_POINTS | FILE_SUPPORTS_SPARSE_FILES;
+  // 使用 NTFS 作为文件系统名称，提升与系统组件的兼容性
+  std::wstring fsn = L"NTFS";
   wcsncpy_s(filesystem_name_buffer, filesystem_name_size, fsn.c_str(), _TRUNCATE);
   std::wcerr << L"[dokan] GetVolumeInformation" << L"\n";
   return STATUS_SUCCESS;

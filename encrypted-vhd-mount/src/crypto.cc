@@ -7,6 +7,8 @@
 #include <iostream>
 #include <fstream>
 #include <vector>
+#include <algorithm>
+#include <array>
 
 static std::string WideToUtf8(const std::wstring &w) {
   if (w.empty()) return std::string();
@@ -134,8 +136,14 @@ bool CryptoContext::deriveKey(const std::wstring &password, const Params &params
 
   std::vector<uint8_t> finalKey(32);
 
-  if (params.kdfMethod == 0 /*KDF_PASSWORD*/ || (params.kdfMethod != 1 && params.keyFilePath.empty())) {
-    // Default password-only
+  // Enforce header-selected KDF strictly. Do not fall back silently.
+  if (params.kdfMethod == 0 /*KDF_PASSWORD*/) {
+    // Require non-empty password
+    if (password.empty()) {
+      std::cerr << "KDF_PASSWORD requires a non-empty password" << std::endl;
+      BCryptCloseAlgorithmProvider(hPbkdf, 0);
+      return false;
+    }
     std::string pwUtf8 = WideToUtf8(password);
     status = BCryptDeriveKeyPBKDF2(hPbkdf,
                                    (PUCHAR)pwUtf8.data(), (ULONG)pwUtf8.size(),
@@ -143,8 +151,13 @@ bool CryptoContext::deriveKey(const std::wstring &password, const Params &params
                                    (ULONGLONG)params.iterations,
                                    (PUCHAR)finalKey.data(), (ULONG)finalKey.size(), 0);
     if (status != 0) { std::cerr << "BCryptDeriveKeyPBKDF2(pw) failed: 0x" << std::hex << status << std::dec << std::endl; BCryptCloseAlgorithmProvider(hPbkdf, 0); return false; }
-  } else if (params.kdfMethod == 1 /*KDF_KEYFILE*/ && !params.keyFilePath.empty()) {
-    // Keyfile-only: PBKDF2 with SHA256(keyfile) as password
+  } else if (params.kdfMethod == 1 /*KDF_KEYFILE*/) {
+    // Require key file path
+    if (params.keyFilePath.empty()) {
+      std::cerr << "KDF_KEYFILE requires a key file path" << std::endl;
+      BCryptCloseAlgorithmProvider(hPbkdf, 0);
+      return false;
+    }
     std::vector<uint8_t> digest;
     if (!sha256File(params.keyFilePath, digest)) { BCryptCloseAlgorithmProvider(hPbkdf, 0); return false; }
     status = BCryptDeriveKeyPBKDF2(hPbkdf,
@@ -153,8 +166,13 @@ bool CryptoContext::deriveKey(const std::wstring &password, const Params &params
                                    (ULONGLONG)params.iterations,
                                    (PUCHAR)finalKey.data(), (ULONG)finalKey.size(), 0);
     if (status != 0) { std::cerr << "BCryptDeriveKeyPBKDF2(keyfile) failed: 0x" << std::hex << status << std::dec << std::endl; BCryptCloseAlgorithmProvider(hPbkdf, 0); return false; }
-  } else if (params.kdfMethod == 2 /*KDF_PASSWORD_PLUS_KEYFILE*/ && !params.keyFilePath.empty()) {
-    // Combined: pbkdfKey from password, then HMAC-SHA256(keyfileDigest, pbkdfKey||salt||nonce)
+  } else if (params.kdfMethod == 2 /*KDF_PASSWORD_PLUS_KEYFILE*/) {
+    // Require both password and key file
+    if (password.empty() || params.keyFilePath.empty()) {
+      std::cerr << "KDF_PASSWORD_PLUS_KEYFILE requires both password and key file" << std::endl;
+      BCryptCloseAlgorithmProvider(hPbkdf, 0);
+      return false;
+    }
     std::string pwUtf8 = WideToUtf8(password);
     std::vector<uint8_t> pbkdfKey(32);
     status = BCryptDeriveKeyPBKDF2(hPbkdf,
@@ -176,7 +194,7 @@ bool CryptoContext::deriveKey(const std::wstring &password, const Params &params
 
     if (!hmacSha256(digest, data, finalKey)) { BCryptCloseAlgorithmProvider(hPbkdf, 0); return false; }
   } else {
-    std::cerr << "Unsupported KDF method or missing keyfile" << std::endl;
+    std::cerr << "Unsupported KDF method: " << params.kdfMethod << std::endl;
     BCryptCloseAlgorithmProvider(hPbkdf, 0);
     return false;
   }
@@ -242,4 +260,13 @@ bool CryptoContext::decryptRange(uint64_t fileOffset, uint8_t *buffer, size_t le
 
 bool CryptoContext::encryptRange(uint64_t fileOffset, uint8_t *buffer, size_t length) {
   return aesCtrCrypt(fileOffset, buffer, length);
+}
+
+std::array<uint8_t, 8> CryptoContext::keyPrefix8() const {
+  std::array<uint8_t, 8> fp{};
+  if (!m_key.empty()) {
+    size_t take = (m_key.size() < fp.size()) ? m_key.size() : fp.size();
+    memcpy(fp.data(), m_key.data(), take);
+  }
+  return fp;
 }

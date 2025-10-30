@@ -5,7 +5,10 @@
 #include <random>
 #include <cstring>
 #include <iostream>
+#include <string>
+#include <array>
 #include <filesystem>
+#include <algorithm>
 
 namespace evhd {
 
@@ -16,6 +19,63 @@ static void randomBytes(uint8_t *buf, size_t n) {
   for (size_t i = 0; i < n; ++i) buf[i] = static_cast<uint8_t>(dist(gen));
 }
 
+static std::wstring hexBytes(const uint8_t *data, size_t n) {
+  static const wchar_t *digits = L"0123456789abcdef";
+  std::wstring out; out.reserve(n * 2);
+  for (size_t i = 0; i < n; ++i) {
+    uint8_t v = data[i];
+    out.push_back(digits[v >> 4]);
+    out.push_back(digits[v & 0x0F]);
+  }
+  return out;
+}
+
+// splitmix64: 简单可复现的伪随机生成器（基于块索引）。
+static inline uint64_t splitmix64(uint64_t x) {
+  x += 0x9e3779b97f4a7c15ULL;
+  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+  return x ^ (x >> 31);
+}
+
+// 从16字节盐派生64位种子（无需密码，独立用于填充生成）。
+static uint64_t deriveSeedFromSalt(const uint8_t *salt16) {
+  uint64_t s0 = 0, s1 = 0;
+  for (int i = 0; i < 8; ++i) { s0 = (s0 << 8) ^ salt16[i]; }
+  for (int i = 8; i < 16; ++i) { s1 = (s1 << 8) ^ salt16[i]; }
+  return splitmix64(s0 ^ s1 ^ 0x6a09e667f3bcc908ULL);
+}
+
+// 在绝对偏移 absStart 处生成长度 len 的伪随机填充，写入 dst。
+static void fillPseudoRandom(uint8_t *dst, size_t len, uint64_t seed, uint64_t absStart) {
+  uint64_t firstBlock = absStart / 8ULL;
+  size_t offsetInBlock = static_cast<size_t>(absStart % 8ULL);
+  size_t produced = 0;
+  while (produced < len) {
+    uint64_t r = splitmix64(seed ^ (firstBlock));
+    uint8_t block[8];
+    memcpy(block, &r, 8);
+    size_t take = std::min<size_t>(len - produced, 8 - offsetInBlock);
+    memcpy(dst + produced, block + offsetInBlock, take);
+    produced += take;
+    firstBlock += 1;
+    offsetInBlock = 0;
+  }
+}
+
+// 朴素 CRC32 实现（poly 0xEDB88320），支持增量更新。
+static uint32_t crc32_update(uint32_t crc, const uint8_t *data, size_t len) {
+  // 约定：调用者将初始 crc 设置为 0xFFFFFFFF，最终取反得到结果。
+  for (size_t i = 0; i < len; ++i) {
+    crc ^= data[i];
+    for (int j = 0; j < 8; ++j) {
+      uint32_t mask = -(int)(crc & 1U);
+      crc = (crc >> 1) ^ (0xEDB88320U & mask);
+    }
+  }
+  return crc;
+}
+
 bool Container::openEncrypted(const std::wstring &path, const std::wstring &password,
                               const std::wstring &keyFilePath) {
   close();
@@ -24,7 +84,44 @@ bool Container::openEncrypted(const std::wstring &path, const std::wstring &pass
   if (!m_file.is_open()) { std::wcerr << L"[evhd] open file failed: " << path << std::endl; return false; }
 
   if (!readHeader()) { std::wcerr << L"[evhd] read header failed" << std::endl; return false; }
-  std::wcerr << L"[evhd] header ok. plaintext size=" << m_header.originalSize << L" bytes, iterations=" << m_header.kdfIterations << L"\n";
+  {
+    const wchar_t *kdfName = L"password";
+    if (m_header.kdfMethod == 1) kdfName = L"keyfile";
+    else if (m_header.kdfMethod == 2) kdfName = L"password+keyfile";
+    std::wcerr << L"[evhd] header ok. plaintext size=" << m_header.originalSize
+               << L" bytes, iterations=" << m_header.kdfIterations
+               << L", kdfMethod=" << kdfName << L"\n";
+    // extra diagnostics: header version, payload offset, relocation entries count
+    std::wcerr << L"[evhd] version=" << m_header.version
+               << L" payloadOffset=" << m_payloadOffset
+               << L" relocCount=" << m_relocations.size() << L"\n";
+    if (m_header.version >= 4 && !m_relocations.empty()) {
+      std::wcerr << L"[evhd] relocations:" << L"\n";
+      for (size_t i = 0; i < m_relocations.size(); ++i) {
+        const auto &e = m_relocations[i];
+        std::wcerr << L"  reloc[" << i << L"] logic=" << e.logicalOffset
+                    << L" len=" << e.length
+                    << L" phys=" << e.physicalOffset << L"\n";
+      }
+      // Sanity check: flag entries beyond plaintext size
+      size_t invalid = 0;
+      for (size_t i = 0; i < m_relocations.size(); ++i) {
+        const auto &e = m_relocations[i];
+        bool bad = (e.length == 0) || (e.logicalOffset >= m_header.originalSize) ||
+                   (e.logicalOffset + e.length > m_header.originalSize);
+        if (bad) {
+          ++invalid;
+          std::wcerr << L"  [evhd] invalid reloc entry index=" << i
+                     << L" (logic=" << e.logicalOffset
+                     << L" len=" << e.length
+                     << L" phys=" << e.physicalOffset << L")\n";
+        }
+      }
+      if (invalid > 0) {
+        std::wcerr << L"[evhd] WARNING: detected " << invalid << L" invalid relocation entries (out of range)." << L"\n";
+      }
+    }
+  }
 
   CryptoContext::Params p;
   p.salt.assign(std::begin(m_header.salt), std::end(m_header.salt));
@@ -33,6 +130,23 @@ bool Container::openEncrypted(const std::wstring &path, const std::wstring &pass
   p.kdfMethod = m_header.kdfMethod;
   p.keyFilePath = keyFilePath;
   if (!m_crypto.init(password, p)) { std::wcerr << L"[evhd] crypto init failed" << std::endl; return false; }
+
+  // Print KDF diagnostics: salt, nonce, and key prefix fingerprint
+  auto keyPrefix = m_crypto.keyPrefix8();
+  std::wcerr << L"[evhd] kdf salt=" << hexBytes(m_header.salt, sizeof(m_header.salt))
+             << L" nonce=" << hexBytes(m_header.nonce, sizeof(m_header.nonce))
+             << L" key[0..7]=" << hexBytes(keyPrefix.data(), keyPrefix.size()) << L"\n";
+
+  // Integrity check: validate pseudo-random pad fingerprint over cut ranges
+  bool integrityOk = verifyIntegrity();
+  if (!integrityOk) {
+    std::wcerr << L"[evhd] integrity check FAILED: pseudo pad CRC mismatch or read error" << std::endl;
+    // 严格模式：校验失败则拒绝打开
+    m_ready = false;
+    return false;
+  } else {
+    std::wcerr << L"[evhd] integrity check OK" << std::endl;
+  }
 
   m_ready = true;
   return true;
@@ -57,7 +171,7 @@ bool Container::createFromPlainVhd(const std::wstring &plainVhdPath, const std::
   // Prepare header
   memset(&m_header, 0, sizeof(m_header));
   memcpy(m_header.magic, MAGIC, sizeof(m_header.magic));
-  m_header.version = 3; // v3: add kdfMethod + metadata (original filename)
+  m_header.version = 4; // v4: add relocation metadata for partition table obfuscation
   m_header.kdfIterations = iterations;
   m_header.originalSize = size;
   randomBytes(m_header.salt, sizeof(m_header.salt));
@@ -72,8 +186,12 @@ bool Container::createFromPlainVhd(const std::wstring &plainVhdPath, const std::
   std::wstring baseName = std::filesystem::path(plainVhdPath).filename().c_str();
   m_originalName = baseName;
   if (!writeHeader()) { std::wcerr << L"EVHD header write failed" << std::endl; return false; }
-  // Compute payload offset
-  m_payloadOffset = sizeof(Header);
+  // Compute payload offset using the same layout logic as readHeader
+  struct HeaderV1 { char magic[8]; uint32_t version; uint32_t kdfIterations; uint64_t originalSize; uint8_t salt[16]; uint8_t nonce[16]; };
+  m_payloadOffset = sizeof(HeaderV1);
+  if (m_header.version >= 3) {
+    m_payloadOffset += sizeof(uint32_t); // kdfMethod
+  }
   if (m_header.version >= 2) {
     uint32_t nameLen = static_cast<uint32_t>(m_originalName.size());
     m_file.write(reinterpret_cast<const char*>(&nameLen), sizeof(nameLen));
@@ -83,8 +201,177 @@ bool Container::createFromPlainVhd(const std::wstring &plainVhdPath, const std::
     if (!m_file) { std::wcerr << L"Write metadata (filename) failed" << std::endl; return false; }
     m_payloadOffset += sizeof(uint32_t) + static_cast<uint64_t>(nameLen) * sizeof(wchar_t);
   }
+  // v4: 写入重定位条目占位（稍后实际写入前需确定条目），先准备重定位计划
+  // 检测并收集需要剪切的分区表范围
+  const uint64_t sectorSize = 512;
+  struct PlanItem { uint64_t logicalOffset; uint64_t length; };
+  std::vector<PlanItem> plan;
+  {
+    // 读取MBR扇区 0 作为判断依据
+    std::vector<uint8_t> sec0(sectorSize);
+    in.read(reinterpret_cast<char*>(sec0.data()), sec0.size());
+    if (!in) { std::wcerr << L"Read sector0 failed" << std::endl; return false; }
+    // 恢复读指针
+    in.seekg(0, std::ios::beg);
+    bool has55AA = (sec0[510] == 0x55 && sec0[511] == 0xAA);
+    if (has55AA) {
+      // MBR分区表条目 446..509 (64字节)。保留签名(510..511)不剪切。
+      plan.push_back({446, 64});
+      // 检测GPT：保护MBR类型0xEE在第一个分区条目
+      bool protectiveGPT = (sec0[446 + 4] == 0xEE);
+      if (protectiveGPT && size >= sectorSize * 2) {
+        // 读取LBA1 GPT头
+        std::vector<uint8_t> gpt(sectorSize);
+        in.seekg(sectorSize, std::ios::beg);
+        in.read(reinterpret_cast<char*>(gpt.data()), gpt.size());
+        if (in) {
+          const char sig[8] = {'E','F','I',' ','P','A','R','T'};
+          if (memcmp(gpt.data(), sig, 8) == 0) {
+            // Partition entries start LBA @ offset 0x48 (uint64), number @ 0x2C (uint32), size @ 0x30 (uint32)
+            uint64_t partStartLBA = *reinterpret_cast<const uint64_t*>(&gpt[0x48]);
+            uint32_t numEntries = *reinterpret_cast<const uint32_t*>(&gpt[0x2C]);
+            uint32_t entrySize = *reinterpret_cast<const uint32_t*>(&gpt[0x30]);
+            bool validLBA = (partStartLBA >= 2) && (partStartLBA < (size / sectorSize));
+            bool validEntrySize = (entrySize >= 128) && (entrySize <= 4096) && (entrySize % 8 == 0);
+            bool validNum = (numEntries > 0) && (numEntries <= 4096);
+            uint64_t gptEntriesOffset = validLBA ? (sectorSize * partStartLBA) : 0;
+            uint64_t entriesBytes = 0;
+            if (validEntrySize && validNum && validLBA) {
+              entriesBytes = static_cast<uint64_t>(numEntries) * entrySize;
+              uint64_t maxBytes = (gptEntriesOffset < size) ? (size - gptEntriesOffset) : 0;
+              if (entriesBytes > maxBytes) entriesBytes = maxBytes;
+            }
+            uint64_t gptHeaderOffset = sectorSize * 1;
+            // 迁移主GPT头 + 主分区表（仅当参数有效且长度>0）
+            plan.push_back({gptHeaderOffset, sectorSize});
+            if (entriesBytes > 0) {
+              plan.push_back({gptEntriesOffset, entriesBytes});
+            }
+            // 处理备份GPT：剪切备份头与备份分区表
+            uint64_t backupLBA = *reinterpret_cast<const uint64_t*>(&gpt[0x20]);
+            uint64_t backupHeaderOffset = sectorSize * backupLBA;
+            if (backupHeaderOffset + sectorSize <= size) {
+              std::vector<uint8_t> gptBackup(sectorSize);
+              in.seekg(static_cast<std::streamoff>(backupHeaderOffset), std::ios::beg);
+              in.read(reinterpret_cast<char*>(gptBackup.data()), gptBackup.size());
+              if (in && memcmp(gptBackup.data(), sig, 8) == 0) {
+                uint64_t backupPartStartLBA = *reinterpret_cast<const uint64_t*>(&gptBackup[0x48]);
+                uint32_t backupNumEntries = *reinterpret_cast<const uint32_t*>(&gptBackup[0x2C]);
+                uint32_t backupEntrySize = *reinterpret_cast<const uint32_t*>(&gptBackup[0x30]);
+                bool bValidLBA = (backupPartStartLBA >= 2) && (backupPartStartLBA < (size / sectorSize));
+                bool bValidEntrySize = (backupEntrySize >= 128) && (backupEntrySize <= 4096) && (backupEntrySize % 8 == 0);
+                bool bValidNum = (backupNumEntries > 0) && (backupNumEntries <= 4096);
+                uint64_t backupEntriesOffset = bValidLBA ? (sectorSize * backupPartStartLBA) : 0;
+                uint64_t backupEntriesBytes = 0;
+                if (bValidEntrySize && bValidNum && bValidLBA) {
+                  backupEntriesBytes = static_cast<uint64_t>(backupNumEntries) * backupEntrySize;
+                  uint64_t bMaxBytes = (backupEntriesOffset < size) ? (size - backupEntriesOffset) : 0;
+                  if (backupEntriesBytes > bMaxBytes) backupEntriesBytes = bMaxBytes;
+                }
+                plan.push_back({backupHeaderOffset, sectorSize});
+                if (backupEntriesBytes > 0) {
+                  plan.push_back({backupEntriesOffset, backupEntriesBytes});
+                }
+              }
+              // 恢复读指针
+              in.seekg(0, std::ios::beg);
+            }
+          }
+        }
+        // 恢复读指针
+        in.seekg(0, std::ios::beg);
+      }
+    }
+  }
+  // 计划健壮化：排序、去重并合并重叠区间，过滤非法/零长度条目
+  if (!plan.empty()) {
+    // 过滤非法
+    std::vector<PlanItem> filtered; filtered.reserve(plan.size());
+    for (const auto &pi : plan) {
+      if (pi.length == 0) continue;
+      if (pi.logicalOffset >= size) continue;
+      uint64_t maxLen = size - pi.logicalOffset;
+      uint64_t len = (pi.length > maxLen) ? maxLen : pi.length;
+      if (len == 0) continue;
+      filtered.push_back({pi.logicalOffset, len});
+    }
+    plan.swap(filtered);
+
+    // 排序
+    std::sort(plan.begin(), plan.end(), [](const PlanItem &a, const PlanItem &b){
+      if (a.logicalOffset == b.logicalOffset) return a.length < b.length;
+      return a.logicalOffset < b.logicalOffset;
+    });
+    // 合并重叠
+    std::vector<PlanItem> merged; merged.reserve(plan.size());
+    for (const auto &pi : plan) {
+      if (merged.empty()) { merged.push_back(pi); continue; }
+      auto &last = merged.back();
+      uint64_t lastEnd = last.logicalOffset + last.length;
+      uint64_t curEnd = pi.logicalOffset + pi.length;
+      if (pi.logicalOffset <= lastEnd) {
+        // 重叠或相邻，合并到更大的范围
+        if (curEnd > lastEnd) {
+          last.length = curEnd - last.logicalOffset;
+        }
+      } else {
+        merged.push_back(pi);
+      }
+    }
+    plan.swap(merged);
+  }
+  // 为每个条目分配物理存放位置（尾部追加），按512对齐
+  auto align512 = [](uint64_t x) { return (x + 511ULL) & ~511ULL; };
+  uint64_t relocBase = size;
+  uint64_t accum = 0;
+  m_relocations.clear();
+  std::vector<std::vector<uint8_t>> relocData; relocData.reserve(plan.size());
+  for (const auto &pi : plan) {
+    RelocEntry e{}; e.logicalOffset = pi.logicalOffset; e.length = pi.length; e.physicalOffset = align512(relocBase + accum);
+    accum = align512(accum + pi.length);
+    m_relocations.push_back(e);
+    // 捕获原始数据备份
+    std::vector<uint8_t> data(pi.length);
+    in.seekg(static_cast<std::streamoff>(pi.logicalOffset), std::ios::beg);
+    in.read(reinterpret_cast<char*>(data.data()), data.size());
+    if (!in) { std::wcerr << L"Capture relocation bytes failed at logical=" << pi.logicalOffset << L" len=" << pi.length << std::endl; return false; }
+    relocData.push_back(std::move(data));
+  }
+
+  // 诊断：打印将要写入的重定位条目
+  std::wcerr << L"[evhd] create: relocations to write:" << L"\n";
+  for (size_t i = 0; i < m_relocations.size(); ++i) {
+    const auto &e = m_relocations[i];
+    std::wcerr << L"  reloc[" << i << L"] logic=" << e.logicalOffset
+               << L" len=" << e.length
+               << L" phys=" << e.physicalOffset << L"\n";
+  }
+  // 写入重定位元数据：count + entries
+  if (m_header.version >= 4) {
+    uint32_t count = static_cast<uint32_t>(m_relocations.size());
+    m_file.write(reinterpret_cast<const char*>(&count), sizeof(count));
+    for (const auto &e : m_relocations) {
+      m_file.write(reinterpret_cast<const char*>(&e.logicalOffset), sizeof(e.logicalOffset));
+      m_file.write(reinterpret_cast<const char*>(&e.length), sizeof(e.length));
+      m_file.write(reinterpret_cast<const char*>(&e.physicalOffset), sizeof(e.physicalOffset));
+    }
+    if (!m_file) { std::wcerr << L"Write relocation metadata failed" << std::endl; return false; }
+    m_payloadOffset += sizeof(uint32_t) + static_cast<uint64_t>(count) * (sizeof(uint64_t) * 3);
+    // v4 扩展：写入填充指纹盐与占位CRC32，稍后回填CRC结果
+    randomBytes(m_padSalt, sizeof(m_padSalt));
+    uint32_t zeroCRC = 0;
+    m_file.write(reinterpret_cast<const char*>(m_padSalt), sizeof(m_padSalt));
+    m_file.write(reinterpret_cast<const char*>(&zeroCRC), sizeof(zeroCRC));
+    if (!m_file) { std::wcerr << L"Write pad fingerprint failed" << std::endl; return false; }
+    m_payloadOffset += sizeof(m_padSalt) + sizeof(uint32_t);
+    // 诊断：打印写入后的条目数量与负载起始偏移
+    std::wcerr << L"[evhd] create: relocCount=" << count
+               << L" payloadOffset=" << m_payloadOffset << L"\n";
+  }
   // Ensure write pointer is at payload start
   m_file.seekp(m_payloadOffset, std::ios::beg);
+  // 重置明文输入流位置，开始顺序加密写入
+  in.seekg(0, std::ios::beg);
 
   // Init crypto
   CryptoContext::Params p;
@@ -95,18 +382,77 @@ bool Container::createFromPlainVhd(const std::wstring &plainVhdPath, const std::
   p.keyFilePath = keyFilePath;
   if (!m_crypto.init(password, p)) { std::wcerr << L"Init crypto context failed" << std::endl; return false; }
 
+  // 打印 KDF 诊断：salt、nonce 和派生密钥前缀指纹
+  {
+    auto keyPrefix = m_crypto.keyPrefix8();
+    std::wcerr << L"[evhd] kdf salt=" << hexBytes(m_header.salt, sizeof(m_header.salt))
+               << L" nonce=" << hexBytes(m_header.nonce, sizeof(m_header.nonce))
+               << L" key[0..7]=" << hexBytes(keyPrefix.data(), keyPrefix.size()) << L"\n";
+  }
+
   // Stream encrypt
   const size_t bufSize = 1024 * 1024; // 1MB buffer
   std::vector<uint8_t> buf(bufSize);
   uint64_t offset = 0;
+  // 初始化伪随机填充生成的种子与CRC
+  uint64_t padSeed = deriveSeedFromSalt(m_padSalt);
+  uint32_t padCRC = 0xFFFFFFFFU;
   while (offset < size) {
     size_t chunk = static_cast<size_t>(std::min<uint64_t>(bufSize, size - offset));
     in.read(reinterpret_cast<char*>(buf.data()), chunk);
     if (!in) { std::wcerr << L"Read plaintext VHD failed" << std::endl; return false; }
+    // 对本chunk内的重定位范围进行剪切（填充0），使原位置不再含原分区表
+    if (!m_relocations.empty()) {
+      for (const auto &e : m_relocations) {
+        uint64_t lo = e.logicalOffset;
+        uint64_t hi = e.logicalOffset + e.length;
+        uint64_t cLo = offset;
+        uint64_t cHi = offset + chunk;
+        if (cHi <= lo || hi <= cLo) continue; // no overlap
+        uint64_t s = std::max<uint64_t>(cLo, lo);
+        uint64_t t = std::min<uint64_t>(cHi, hi);
+        size_t relStart = static_cast<size_t>(s - cLo);
+        size_t relLen   = static_cast<size_t>(t - s);
+        // 生成伪随机填充并更新指纹 CRC
+        fillPseudoRandom(buf.data() + relStart, relLen, padSeed, s);
+        padCRC = crc32_update(padCRC, buf.data() + relStart, relLen);
+      }
+    }
     if (!m_crypto.encryptRange(offset, buf.data(), chunk)) { std::wcerr << L"Encrypt block failed" << std::endl; return false; }
     m_file.write(reinterpret_cast<const char*>(buf.data()), chunk);
     if (!m_file) { std::wcerr << L"Write ciphertext payload failed" << std::endl; return false; }
     offset += chunk;
+  }
+  
+  // 最终 CRC 取反得到结果，回填到头部扩展
+  m_padCRC32 = padCRC ^ 0xFFFFFFFFU;
+  if (m_header.version >= 4) {
+    // 计算 CRC 字段的绝对文件偏移（严格对齐 readHeader 布局）：
+    struct HeaderV1 { char magic[8]; uint32_t version; uint32_t kdfIterations; uint64_t originalSize; uint8_t salt[16]; uint8_t nonce[16]; };
+    uint64_t base = sizeof(HeaderV1);
+    if (m_header.version >= 3) {
+      base += sizeof(uint32_t); // kdfMethod
+    }
+    if (m_header.version >= 2) {
+      uint32_t nameLen = static_cast<uint32_t>(m_originalName.size());
+      base += sizeof(uint32_t) + static_cast<uint64_t>(nameLen) * sizeof(wchar_t);
+    }
+    uint32_t count = static_cast<uint32_t>(m_relocations.size());
+    base += sizeof(uint32_t) + static_cast<uint64_t>(count) * (sizeof(uint64_t) * 3);
+    uint64_t padCRCPos = base + sizeof(m_padSalt); // 在盐之后的CRC位置
+    m_file.seekp(padCRCPos, std::ios::beg);
+    m_file.write(reinterpret_cast<const char*>(&m_padCRC32), sizeof(m_padCRC32));
+    if (!m_file) { std::wcerr << L"Backfill pad CRC32 failed" << std::endl; return false; }
+  }
+
+  // 追加尾部：写入被剪切出来的原始数据（使用其物理偏移作为CTR偏移）
+  for (size_t i = 0; i < m_relocations.size(); ++i) {
+    const auto &e = m_relocations[i];
+    std::vector<uint8_t> tmp = relocData[i];
+    if (!m_crypto.encryptRange(e.physicalOffset, tmp.data(), tmp.size())) { std::wcerr << L"Encrypt relocated segment failed" << std::endl; return false; }
+    m_file.seekp(m_payloadOffset + e.physicalOffset, std::ios::beg);
+    m_file.write(reinterpret_cast<const char*>(tmp.data()), tmp.size());
+    if (!m_file) { std::wcerr << L"Write relocated segment failed" << std::endl; return false; }
   }
 
   m_file.flush();
@@ -119,22 +465,57 @@ bool Container::createFromPlainVhd(const std::wstring &plainVhdPath, const std::
 bool Container::readPlain(uint64_t offset, uint8_t *buffer, size_t length) {
   if (!m_ready || !buffer || length == 0) return false;
   std::lock_guard<std::mutex> lock(m_mutex);
-  // Seek to encrypted payload offset (header + offset)
-  m_file.seekg(m_payloadOffset + offset, std::ios::beg);
-  m_file.read(reinterpret_cast<char*>(buffer), length);
-  if (!m_file) return false;
-  return m_crypto.decryptRange(offset, buffer, length);
+  if (m_debug) {
+    std::wcerr << L"[evhd] readPlain offset=" << offset << L" len=" << length << L"\n";
+  }
+  // 将逻辑请求映射为一个或多个物理段
+  std::vector<RelocEntry> segs; mapLogicalToPhysical(offset, length, segs);
+  if (m_debug) {
+    std::wcerr << L"[evhd] segments count=" << segs.size() << L"\n";
+    for (size_t i = 0; i < segs.size(); ++i) {
+      const auto &s = segs[i];
+      std::wcerr << L"  seg[" << i << L"] logic=" << s.logicalOffset << L" phys=" << s.physicalOffset << L" len=" << s.length << L"\n";
+    }
+  }
+  size_t bufPos = 0;
+  for (const auto &s : segs) {
+    // 清理流状态以防之前的失败导致 seek/read 无效
+    m_file.clear();
+    m_file.seekg(m_payloadOffset + s.physicalOffset, std::ios::beg);
+    m_file.read(reinterpret_cast<char*>(buffer + bufPos), s.length);
+    if (!m_file) {
+      if (m_debug) {
+        std::wcerr << L"[evhd] read fail at phys=" << s.physicalOffset << L" len=" << s.length << L" payloadBase=" << m_payloadOffset << L"\n";
+      }
+      return false;
+    }
+    if (!m_crypto.decryptRange(s.physicalOffset, buffer + bufPos, static_cast<size_t>(s.length))) {
+      if (m_debug) {
+        std::wcerr << L"[evhd] decryptRange failed at phys=" << s.physicalOffset << L" len=" << s.length << L"\n";
+      }
+      return false;
+    }
+    bufPos += static_cast<size_t>(s.length);
+  }
+  return true;
 }
 
 bool Container::writePlain(uint64_t offset, const uint8_t *buffer, size_t length) {
   if (!m_ready || !buffer || length == 0) return false;
   std::lock_guard<std::mutex> lock(m_mutex);
-  // Copy into temp to encrypt in-place
-  std::vector<uint8_t> tmp(buffer, buffer + length);
-  if (!m_crypto.encryptRange(offset, tmp.data(), length)) return false;
-  m_file.seekp(m_payloadOffset + offset, std::ios::beg);
-  m_file.write(reinterpret_cast<const char*>(tmp.data()), length);
-  return !!m_file;
+  // 将逻辑写入拆分为物理段（重定位范围写入尾部）
+  std::vector<RelocEntry> segs; mapLogicalToPhysical(offset, length, segs);
+  size_t bufPos = 0;
+  for (const auto &s : segs) {
+    std::vector<uint8_t> tmp(buffer + bufPos, buffer + bufPos + static_cast<size_t>(s.length));
+    if (!m_crypto.encryptRange(s.physicalOffset, tmp.data(), static_cast<size_t>(s.length))) return false;
+    m_file.clear();
+    m_file.seekp(m_payloadOffset + s.physicalOffset, std::ios::beg);
+    m_file.write(reinterpret_cast<const char*>(tmp.data()), static_cast<size_t>(s.length));
+    if (!m_file) return false;
+    bufPos += static_cast<size_t>(s.length);
+  }
+  return true;
 }
 
 bool Container::readHeader() {
@@ -151,7 +532,7 @@ bool Container::readHeader() {
   m_file.read(reinterpret_cast<char*>(&v1), sizeof(v1));
   if (!m_file) return false;
   if (memcmp(v1.magic, MAGIC, sizeof(v1.magic)) != 0) return false;
-  if (v1.version != 1 && v1.version != 2 && v1.version != 3) return false;
+  if (v1.version != 1 && v1.version != 2 && v1.version != 3 && v1.version != 4) return false;
   // fill common fields
   memcpy(m_header.magic, v1.magic, sizeof(m_header.magic));
   m_header.version = v1.version;
@@ -183,18 +564,150 @@ bool Container::readHeader() {
     }
     m_payloadOffset += sizeof(uint32_t) + static_cast<uint64_t>(nameLen) * sizeof(wchar_t);
   }
+  // v4: 读取重定位条目（如存在）
+  if (m_header.version >= 4) {
+    uint32_t count = 0;
+    m_file.read(reinterpret_cast<char*>(&count), sizeof(count));
+    if (!m_file) return false;
+    m_relocations.clear(); m_relocations.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+      RelocEntry e{};
+      m_file.read(reinterpret_cast<char*>(&e.logicalOffset), sizeof(e.logicalOffset));
+      m_file.read(reinterpret_cast<char*>(&e.length), sizeof(e.length));
+      m_file.read(reinterpret_cast<char*>(&e.physicalOffset), sizeof(e.physicalOffset));
+      if (!m_file) return false;
+      m_relocations.push_back(e);
+    }
+    m_payloadOffset += sizeof(uint32_t) + static_cast<uint64_t>(count) * (sizeof(uint64_t) * 3);
+    // 额外读取填充指纹：16字节盐 + 4字节CRC32
+    m_file.read(reinterpret_cast<char*>(m_padSalt), sizeof(m_padSalt));
+    m_file.read(reinterpret_cast<char*>(&m_padCRC32), sizeof(m_padCRC32));
+    if (!m_file) return false;
+    m_payloadOffset += sizeof(m_padSalt) + sizeof(uint32_t);
+  }
   return true;
 }
 
 bool Container::writeHeader() {
+  // 规范化写入：按 readHeader 使用的布局逐字段写入，避免结构体填充差异
   m_file.seekp(0, std::ios::beg);
-  m_file.write(reinterpret_cast<const char*>(&m_header), sizeof(m_header));
+  struct HeaderV1 {
+    char magic[8];
+    uint32_t version;
+    uint32_t kdfIterations;
+    uint64_t originalSize;
+    uint8_t  salt[16];
+    uint8_t  nonce[16];
+  } v1{};
+  memcpy(v1.magic, m_header.magic, sizeof(v1.magic));
+  v1.version = m_header.version;
+  v1.kdfIterations = m_header.kdfIterations;
+  v1.originalSize = m_header.originalSize;
+  memcpy(v1.salt, m_header.salt, sizeof(v1.salt));
+  memcpy(v1.nonce, m_header.nonce, sizeof(v1.nonce));
+  m_file.write(reinterpret_cast<const char*>(&v1), sizeof(v1));
+  if (!m_file) return false;
+  if (m_header.version >= 3) {
+    uint32_t method = m_header.kdfMethod;
+    m_file.write(reinterpret_cast<const char*>(&method), sizeof(method));
+    if (!m_file) return false;
+  }
+  m_file.flush();
   return !!m_file;
 }
 
 void Container::close() {
   m_ready = false;
   if (m_file.is_open()) m_file.close();
+}
+
+// 将逻辑范围拆分为一个或多个物理段，以便读取/写入时正确应用CTR偏移
+void Container::mapLogicalToPhysical(uint64_t logicalOffset, size_t length,
+                                     std::vector<RelocEntry> &outSegments) const {
+  outSegments.clear();
+  uint64_t cur = logicalOffset;
+  uint64_t end = logicalOffset + static_cast<uint64_t>(length);
+  while (cur < end) {
+    // 查找覆盖当前偏移的重定位条目
+    const RelocEntry *hit = nullptr;
+    for (const auto &e : m_relocations) {
+      if (cur >= e.logicalOffset && cur < e.logicalOffset + e.length) { hit = &e; break; }
+    }
+    if (hit) {
+      uint64_t within = cur - hit->logicalOffset;
+      uint64_t maxLen = hit->length - within;
+      uint64_t segLen = std::min<uint64_t>(maxLen, end - cur);
+      RelocEntry seg{}; seg.logicalOffset = cur; seg.length = segLen; seg.physicalOffset = hit->physicalOffset + within;
+      outSegments.push_back(seg);
+      cur += segLen;
+    } else {
+      // 非重定位区：物理偏移==逻辑偏移，长度直到下一个重定位开始或请求结束
+      uint64_t nextRelocStart = end;
+      for (const auto &e : m_relocations) {
+        if (e.logicalOffset > cur) nextRelocStart = std::min(nextRelocStart, e.logicalOffset);
+      }
+      uint64_t segLen = std::min<uint64_t>(nextRelocStart - cur, end - cur);
+      RelocEntry seg{}; seg.logicalOffset = cur; seg.length = segLen; seg.physicalOffset = cur;
+      outSegments.push_back(seg);
+      cur += segLen;
+    }
+  }
+}
+
+// 打开时完整性校验：读取主负载区中被剪切的逻辑范围，解密并计算CRC，与头部指纹对比
+bool Container::verifyIntegrity() {
+  if (m_header.version < 4) {
+    // v1-v3 不包含剪切填充指纹，视为跳过校验
+    return true;
+  }
+  // 诊断输出基础信息
+  std::wcerr << L"[evhd] integrity: payloadOffset=" << m_payloadOffset
+             << L" relocCount=" << m_relocations.size() << L" padSalt="
+             << hexBytes(m_padSalt, sizeof(m_padSalt)) << L"\n";
+
+  // 以逻辑顺序处理所有剪切范围，逐段从主负载区读取并解密
+  std::vector<RelocEntry> ranges = m_relocations;
+  std::sort(ranges.begin(), ranges.end(), [](const RelocEntry &a, const RelocEntry &b){
+    return a.logicalOffset < b.logicalOffset;
+  });
+
+  uint32_t crc = 0xFFFFFFFFU;
+  const size_t bufSize = 1 << 20; // 1MB
+  std::vector<uint8_t> buf; buf.reserve(bufSize);
+
+  for (const auto &e : ranges) {
+    uint64_t processed = 0;
+    while (processed < e.length) {
+      size_t take = static_cast<size_t>(std::min<uint64_t>(bufSize, e.length - processed));
+      buf.assign(take, 0);
+      // 读取主负载区（不应用重定位映射）：绝对文件偏移 = payloadOffset + 逻辑偏移
+      m_file.clear();
+      m_file.seekg(m_payloadOffset + e.logicalOffset + processed, std::ios::beg);
+      m_file.read(reinterpret_cast<char*>(buf.data()), take);
+      if (!m_file) {
+        std::wcerr << L"[evhd] integrity: read fail at logical=" << (e.logicalOffset + processed)
+                   << L" len=" << take << L"\n";
+        return false;
+      }
+      // 使用逻辑偏移作为CTR偏移进行解密（与创建时一致）
+      if (!m_crypto.decryptRange(e.logicalOffset + processed, buf.data(), take)) {
+        std::wcerr << L"[evhd] integrity: decrypt fail at logical=" << (e.logicalOffset + processed)
+                   << L" len=" << take << L"\n";
+        return false;
+      }
+      // 累积CRC（创建时对伪随机填充的CRC应与此解密结果一致）
+      crc = crc32_update(crc, buf.data(), take);
+      processed += take;
+    }
+  }
+
+  uint32_t computed = crc ^ 0xFFFFFFFFU;
+  if (computed != m_padCRC32) {
+    std::wcerr << L"[evhd] integrity: padCRC32 mismatch. expected=0x" << std::hex << m_padCRC32
+               << L" computed=0x" << computed << std::dec << L"\n";
+    return false;
+  }
+  return true;
 }
 
 } // namespace evhd

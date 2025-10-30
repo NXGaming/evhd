@@ -2,6 +2,10 @@
 
 #pragma once
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #include <Windows.h>
 #include <bcrypt.h>
 #include <string>
@@ -27,6 +31,10 @@ public:
   bool encryptRange(uint64_t fileOffset, uint8_t *buffer, size_t length);
 
   bool isReady() const { return m_ready; }
+
+  // Debug-only: return first 8 bytes of derived key as fingerprint
+  // Never used for cryptographic purposes; helps diagnose KDF consistency.
+  std::array<uint8_t, 8> keyPrefix8() const;
 
 private:
   bool deriveKey(const std::wstring &password, const Params &params,

@@ -14,6 +14,7 @@ struct MountConfig {
   std::wstring password;
   std::wstring exposedFileName; // e.g. decrypted.vhd
   std::wstring keyFilePath;     // optional key file
+  bool debug{false};            // enable container debug logs
 };
 
 class MountContext {
