@@ -9,6 +9,7 @@
 #include <array>
 #include <filesystem>
 #include <algorithm>
+#include <malloc.h>
 
 namespace evhd {
 
@@ -86,14 +87,53 @@ bool Container::openEncrypted(const std::wstring &path, const std::wstring &pass
   if (!readHeader()) { std::wcerr << L"[evhd] read header failed" << std::endl; return false; }
 
   // 打开一个原生文件句柄以支持偏移式并发I/O
+  DWORD flags = FILE_FLAG_OVERLAPPED;
+  if (m_unbuffered) {
+    flags |= FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH;
+  }
   m_handle = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
                          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                         nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+                         nullptr, OPEN_EXISTING, flags, nullptr);
   if (m_handle == INVALID_HANDLE_VALUE) {
     if (m_debug) {
       std::wcerr << L"[evhd] CreateFileW failed, err=" << GetLastError() << L"\n";
     }
     return false;
+  }
+
+  if (m_debug) {
+    LARGE_INTEGER sz{};
+    if (GetFileSizeEx(m_handle, &sz)) {
+      std::wcerr << L"[evhd] fileSize=" << sz.QuadPart
+                 << L" payloadOffset=" << m_payloadOffset
+                 << L" payloadEnd=" << (m_payloadOffset + m_header.originalSize) << L"\n";
+    }
+  }
+
+  // Query sector size for alignment when using unbuffered I/O
+  if (m_unbuffered) {
+    // Prefer the file's alignment requirement over volume bytes-per-sector.
+    // On Windows, FileAlignmentInfo.AlignmentRequirement + 1 is the required alignment in bytes
+    // for unbuffered I/O on this specific handle.
+    FILE_ALIGNMENT_INFO alignInfo{};
+    if (GetFileInformationByHandleEx(m_handle, FileAlignmentInfo, &alignInfo, sizeof(alignInfo))) {
+      DWORD align = alignInfo.AlignmentRequirement + 1; // documented requirement
+      if (align == 0) align = 4096; // safety fallback
+      m_sectorSize = std::max<DWORD>(align, 512);
+    } else {
+      // Fallback: query volume bytes-per-sector
+      DWORD spc = 0, bps = 0, nfc = 0, tnc = 0;
+      std::filesystem::path p(path);
+      std::wstring root = p.root_path().c_str();
+      if (GetDiskFreeSpaceW(root.c_str(), &spc, &bps, &nfc, &tnc)) {
+        m_sectorSize = std::max<DWORD>(bps, 512);
+      } else {
+        m_sectorSize = 4096;
+      }
+    }
+    if (m_debug) {
+      std::wcerr << L"[evhd] unbuffered mode. sectorSize=" << m_sectorSize << L" bytes\n";
+    }
   }
 
   if (m_debug) {
@@ -749,56 +789,176 @@ bool Container::verifyIntegrity() {
 // 原生偏移式I/O（Overlapped）辅助：在不改变文件指针的情况下按物理偏移读取
 bool Container::readRawPhys(uint64_t physOffset, uint8_t *dst, size_t len) {
   if (m_handle == INVALID_HANDLE_VALUE) return false;
-  OVERLAPPED ov{};
-  ULONGLONG pos = m_payloadOffset + physOffset;
-  ov.Offset     = static_cast<DWORD>(pos & 0xFFFFFFFFULL);
-  ov.OffsetHigh = static_cast<DWORD>(pos >> 32);
-  HANDLE hEvt = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-  if (!hEvt) return false;
-  ov.hEvent = hEvt;
-  DWORD want = static_cast<DWORD>(len);
-  DWORD done = 0;
-  BOOL ok = ReadFile(m_handle, dst, want, nullptr, &ov);
-  if (!ok) {
-    DWORD err = GetLastError();
-    if (err == ERROR_IO_PENDING) {
-      ok = GetOverlappedResult(m_handle, &ov, &done, TRUE);
+  ULONGLONG abs = m_payloadOffset + physOffset;
+  if (!m_unbuffered) {
+    OVERLAPPED ov{};
+    ov.Offset     = static_cast<DWORD>(abs & 0xFFFFFFFFULL);
+    ov.OffsetHigh = static_cast<DWORD>(abs >> 32);
+    HANDLE hEvt = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!hEvt) return false;
+    ov.hEvent = hEvt;
+    DWORD want = static_cast<DWORD>(len);
+    DWORD done = 0;
+    BOOL ok = ReadFile(m_handle, dst, want, nullptr, &ov);
+    if (!ok) {
+      DWORD err = GetLastError();
+      if (err == ERROR_IO_PENDING) {
+        ok = GetOverlappedResult(m_handle, &ov, &done, TRUE);
+      } else {
+        CloseHandle(hEvt);
+        return false;
+      }
     } else {
-      CloseHandle(hEvt);
-      return false;
+      done = want; // synchronous path
     }
+    CloseHandle(hEvt);
+    return ok && done == want;
   } else {
-    done = want; // synchronous path
+    const uint64_t ss = m_sectorSize;
+    uint64_t start = (abs / ss) * ss;
+    uint64_t end   = ((abs + len + ss - 1) / ss) * ss;
+    size_t need = static_cast<size_t>(end - start);
+
+    // If the aligned range would exceed file size (EOF), fall back to buffered read
+    LARGE_INTEGER fsz{};
+    if (!GetFileSizeEx(m_handle, &fsz)) { return false; }
+    ULONGLONG fileSize = (ULONGLONG)fsz.QuadPart;
+    if (start + need > fileSize) {
+      if (m_debug) {
+        std::wcerr << L"[evhd] unbuffered read touches EOF. Falling back to buffered path. "
+                   << L"abs=" << abs << L" len=" << len << L" start=" << start
+                   << L" alignedNeed=" << need << L" fileSize=" << fileSize << L"\n";
+      }
+      // buffered fallback using std::fstream (thread-safe via mutex)
+      std::lock_guard<std::mutex> lg(m_mutex);
+      m_file.clear();
+      m_file.seekg(static_cast<std::streamoff>(abs), std::ios::beg);
+      m_file.read(reinterpret_cast<char*>(dst), static_cast<std::streamsize>(len));
+      return !!m_file;
+    }
+
+    uint8_t *buf = (uint8_t *)_aligned_malloc(need, ss);
+    if (!buf) return false;
+    OVERLAPPED ov{};
+    ov.Offset     = static_cast<DWORD>(start & 0xFFFFFFFFULL);
+    ov.OffsetHigh = static_cast<DWORD>(start >> 32);
+    HANDLE hEvt = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!hEvt) { _aligned_free(buf); return false; }
+    ov.hEvent = hEvt;
+    DWORD want = static_cast<DWORD>(need);
+    DWORD done = 0;
+    BOOL ok = ReadFile(m_handle, buf, want, nullptr, &ov);
+    if (!ok) {
+      DWORD err = GetLastError();
+      if (err == ERROR_IO_PENDING) {
+        ok = GetOverlappedResult(m_handle, &ov, &done, TRUE);
+      } else {
+        if (m_debug) {
+          std::wcerr << L"[evhd] ReadFile(unbuffered) failed. err=" << err
+                     << L" start=" << start << L" want=" << want << L" ss=" << ss << L"\n";
+        }
+        CloseHandle(hEvt);
+        _aligned_free(buf);
+        return false;
+      }
+    } else {
+      done = want;
+    }
+    CloseHandle(hEvt);
+    if (!(ok && done == want)) { _aligned_free(buf); return false; }
+    size_t inner = static_cast<size_t>(abs - start);
+    memcpy(dst, buf + inner, len);
+    _aligned_free(buf);
+    return true;
   }
-  CloseHandle(hEvt);
-  return ok && done == want;
 }
 
 bool Container::writeRawPhys(uint64_t physOffset, const uint8_t *src, size_t len) {
   if (m_handle == INVALID_HANDLE_VALUE) return false;
-  OVERLAPPED ov{};
-  ULONGLONG pos = m_payloadOffset + physOffset;
-  ov.Offset     = static_cast<DWORD>(pos & 0xFFFFFFFFULL);
-  ov.OffsetHigh = static_cast<DWORD>(pos >> 32);
-  HANDLE hEvt = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-  if (!hEvt) return false;
-  ov.hEvent = hEvt;
-  DWORD want = static_cast<DWORD>(len);
-  DWORD done = 0;
-  BOOL ok = WriteFile(m_handle, src, want, nullptr, &ov);
-  if (!ok) {
-    DWORD err = GetLastError();
-    if (err == ERROR_IO_PENDING) {
-      ok = GetOverlappedResult(m_handle, &ov, &done, TRUE);
+  ULONGLONG abs = m_payloadOffset + physOffset;
+  if (!m_unbuffered) {
+    OVERLAPPED ov{};
+    ov.Offset     = static_cast<DWORD>(abs & 0xFFFFFFFFULL);
+    ov.OffsetHigh = static_cast<DWORD>(abs >> 32);
+    HANDLE hEvt = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!hEvt) return false;
+    ov.hEvent = hEvt;
+    DWORD want = static_cast<DWORD>(len);
+    DWORD done = 0;
+    BOOL ok = WriteFile(m_handle, src, want, nullptr, &ov);
+    if (!ok) {
+      DWORD err = GetLastError();
+      if (err == ERROR_IO_PENDING) {
+        ok = GetOverlappedResult(m_handle, &ov, &done, TRUE);
+      } else {
+        CloseHandle(hEvt);
+        return false;
+      }
     } else {
-      CloseHandle(hEvt);
-      return false;
+      done = want; // synchronous path
     }
+    CloseHandle(hEvt);
+    return ok && done == want;
   } else {
-    done = want; // synchronous path
+    const uint64_t ss = m_sectorSize;
+    uint64_t start = (abs / ss) * ss;
+    uint64_t end   = ((abs + len + ss - 1) / ss) * ss;
+    size_t need = static_cast<size_t>(end - start);
+    uint8_t *buf = (uint8_t *)_aligned_malloc(need, ss);
+    if (!buf) return false;
+    // Read-modify-write for partial sector updates
+    OVERLAPPED ovR{};
+    ovR.Offset     = static_cast<DWORD>(start & 0xFFFFFFFFULL);
+    ovR.OffsetHigh = static_cast<DWORD>(start >> 32);
+    HANDLE hEvtR = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!hEvtR) { _aligned_free(buf); return false; }
+    ovR.hEvent = hEvtR;
+    DWORD wantR = static_cast<DWORD>(need);
+    DWORD doneR = 0;
+    BOOL okR = ReadFile(m_handle, buf, wantR, nullptr, &ovR);
+    if (!okR) {
+      DWORD err = GetLastError();
+      if (err == ERROR_IO_PENDING) {
+        okR = GetOverlappedResult(m_handle, &ovR, &doneR, TRUE);
+      } else {
+        CloseHandle(hEvtR);
+        _aligned_free(buf);
+        return false;
+      }
+    } else {
+      doneR = wantR;
+    }
+    CloseHandle(hEvtR);
+    if (!(okR && doneR == wantR)) { _aligned_free(buf); return false; }
+
+    size_t inner = static_cast<size_t>(abs - start);
+    memcpy(buf + inner, src, len);
+
+    OVERLAPPED ovW{};
+    ovW.Offset     = static_cast<DWORD>(start & 0xFFFFFFFFULL);
+    ovW.OffsetHigh = static_cast<DWORD>(start >> 32);
+    HANDLE hEvtW = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!hEvtW) { _aligned_free(buf); return false; }
+    ovW.hEvent = hEvtW;
+    DWORD wantW = static_cast<DWORD>(need);
+    DWORD doneW = 0;
+    BOOL okW = WriteFile(m_handle, buf, wantW, nullptr, &ovW);
+    if (!okW) {
+      DWORD err = GetLastError();
+      if (err == ERROR_IO_PENDING) {
+        okW = GetOverlappedResult(m_handle, &ovW, &doneW, TRUE);
+      } else {
+        CloseHandle(hEvtW);
+        _aligned_free(buf);
+        return false;
+      }
+    } else {
+      doneW = wantW;
+    }
+    CloseHandle(hEvtW);
+    _aligned_free(buf);
+    return okW && doneW == wantW;
   }
-  CloseHandle(hEvt);
-  return ok && done == want;
 }
 
 } // namespace evhd

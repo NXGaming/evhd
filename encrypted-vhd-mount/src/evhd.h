@@ -55,6 +55,7 @@ public:
   bool writePlain(uint64_t offset, const uint8_t *buffer, size_t length);
 
   void setDebug(bool on) { m_debug = on; }
+  void setUnbuffered(bool on) { m_unbuffered = on; }
 
   uint64_t plaintextSize() const { return m_header.originalSize; }
   std::wstring underlyingPath() const { return m_path; }
@@ -89,6 +90,8 @@ private:
   // v4 扩展：剪切填充指纹与盐（用于生成伪随机填充）
   uint8_t m_padSalt[16]{};
   uint32_t m_padCRC32{0};
+  bool m_unbuffered{false};
+  uint32_t m_sectorSize{4096};
   // 原生偏移式I/O（Overlapped）辅助
   bool readRawPhys(uint64_t physOffset, uint8_t *dst, size_t len);
   bool writeRawPhys(uint64_t physOffset, const uint8_t *src, size_t len);

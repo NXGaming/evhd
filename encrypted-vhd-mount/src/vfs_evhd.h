@@ -15,6 +15,7 @@ struct MountConfig {
   std::wstring exposedFileName; // e.g. decrypted.vhd
   std::wstring keyFilePath;     // optional key file
   bool debug{false};            // enable container debug logs
+  bool directIO{false};         // use unbuffered, write-through I/O
 };
 
 class MountContext {

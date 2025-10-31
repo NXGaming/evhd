@@ -41,9 +41,11 @@ encrypted-vhd-mount.exe /p "YourPassword" c:\path\to\encrypted.evhd M:\
 encrypted-vhd-mount.exe /k c:\path\to\keyfile.bin c:\path\to\encrypted.evhd M:\
 # 密码 + 密钥文件组合：
 encrypted-vhd-mount.exe /p "YourPassword" /k c:\path\to\keyfile.bin c:\path\to\encrypted.evhd M:\
+# 启用 directIO 模式（提升性能）：
+encrypted-vhd-mount.exe /p "YourPassword" /direct c:\path\to\encrypted.evhd M:\
 ```
 
-- 可选：`/d` 显示Dokan调试日志；`/l` 挂载后打开资源管理器。
+- 可选：`/d` 显示Dokan调试日志；`/l` 挂载后打开资源管理器；`/direct` 启用 directIO 模式。
 - `M:\` 可以是盘符或NTFS文件夹路径。
 - 若容器头部包含原始文件名元数据，则挂载盘内文件名会显示为该原始名；否则默认展示为 `decrypted.vhd`。
 
@@ -115,7 +117,48 @@ EVHD 文件头（逐版本扩展）：
 - 旧版本创建的 EVHD 文件可能无法通过新的完整性校验。请使用新可执行文件重新初始化（`/init`）生成新的 EVHD 后再挂载。
 - 创建与读取侧的 `payloadOffset` 计算已统一为“逐字段布局”（不使用结构体 `sizeof`），避免对齐差导致的偏移误差。
 
+### DirectIO 模式与性能优化
+
+#### DirectIO 模式说明
+
+- `/direct` 参数启用 directIO 模式，绕过 Windows 文件系统缓存，直接访问底层加密容器文件。
+- **优势**：减少内存拷贝开销，在大文件顺序读写场景下可显著提升性能。
+- **注意**：directIO 要求读写偏移和长度必须按扇区（512字节）对齐。
+
+#### EOF 边界处理
+
+- 加密容器的负载区结尾可能不按扇区对齐，导致 directIO 读取文件尾部时失败。
+- **自动修复**：程序会检测此类情况并自动回退到缓冲读取模式，确保稳定性。
+- 日志中会显示 `[evhd] unbuffered read touches EOF. Falling back to buffered path.` 提示。
+
+#### 性能基准测试
+
+推荐使用 DiskSpd 进行真实性能测试（禁用缓存）：
+
+```powershell
+# 顺序读测试（1MB 块，32 队列深度，4 线程，30秒）
+diskspd -b1M -d30 -o32 -t4 -r -Sh -Su -c4G M:\benchfile.dat
+
+# 顺序写测试
+diskspd -b1M -d30 -o32 -t4 -w100 -Sh -Su -c4G M:\benchfile.dat
+
+# 随机 4K 读测试
+diskspd -b4K -d30 -o32 -t4 -r -Sh -Su -c4G M:\benchfile.dat
+
+# 随机 4K 写测试
+diskspd -b4K -d30 -o32 -t4 -w100 -Sh -Su -c4G M:\benchfile.dat
+```
+
+**性能期望值**（参考）：
+- 顺序读写：1-3 GB/s（取决于 CPU 核心数与 AES-NI 性能）
+- 随机 4K Q1T1：几十 MB/s
+- 随机 4K Q32T16：几百 MB/s
+
+**注意**：CrystalDiskMark 等工具的顺序读数值可能因 Windows 缓存而虚高，建议使用 DiskSpd 的 `-Sh -Su` 参数禁用缓存获得真实结果。
+
 ### 故障排查
+
+#### 通用问题
 
 - 启用 `/d` 查看调试日志，关注：
   - `version`、`payloadOffset`、`relocCount`；
@@ -125,6 +168,21 @@ EVHD 文件头（逐版本扩展）：
   - 确认使用最新 `encrypted-vhd-mount.exe` 重新执行 `/init`；
   - 排除磁盘/安全软件对 EVHD 主负载的写入；
   - 检查密码/密钥文件路径与 KDF 方法是否一致。
+
+#### DirectIO 相关问题
+
+- **挂载失败或读取错误**：
+  - 检查日志中是否有 `[evhd] readRawPhys fail` 错误（已在新版本修复）。
+  - 确认使用最新版本，旧版本在 directIO 模式下可能在文件尾部读取失败。
+  
+- **性能不如预期**：
+  - 确认已使用 `/direct` 参数启用 directIO 模式。
+  - 使用 DiskSpd 而非 CrystalDiskMark 进行基准测试，后者可能受缓存影响。
+  - 检查 CPU 是否支持 AES-NI 指令集，影响加解密性能。
+  
+- **日志中出现 EOF 回退提示**：
+  - `[evhd] unbuffered read touches EOF. Falling back to buffered path.` 是正常行为。
+  - 这表明程序正确处理了文件尾部的非对齐读取，不影响功能和整体性能。
 
 ## 构建与编码提示
 

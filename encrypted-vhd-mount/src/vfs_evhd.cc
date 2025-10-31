@@ -24,6 +24,7 @@ bool MountContext::setup(const MountConfig &cfg) {
   }
   if (ok) {
     m_container.setDebug(cfg.debug);
+    m_container.setUnbuffered(cfg.directIO);
     // If container carries original filename metadata, expose it
     if (!m_container.originalName().empty()) {
       m_cfg.exposedFileName = m_container.originalName();

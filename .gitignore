@@ -9,3 +9,8 @@ small.vhd
 small-pk.evhd
 test.key
 errorlog.txt
+
+# Benchmark test files
+encrypted-vhd-mount/bench_*.evhd
+encrypted-vhd-mount/bench_*.vhd
+
