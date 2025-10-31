@@ -37,6 +37,28 @@ static void showUsage() {
   std::wcout << L"  /k           密钥文件路径\n";
   std::wcout << L"  /init        输入明文VHD进行加密初始化\n";
   std::wcout << L"  /o           输出加密文件路径\n";
+  std::wcout.flush();
+  // 无控制台场景下，弹出提示以确保帮助信息可见
+  if (GetConsoleWindow() == NULL) {
+    std::wstring msg =
+        L"用法:\n"
+        L"  encrypted-vhd-mount.exe [/d|/l] /p <password> <enc_file> <mount_path>\n"
+        L"  可选: /k <keyfile> 使用密钥文件参与派生\n"
+        L"  初始化:\n"
+        L"  encrypted-vhd-mount.exe /init <plain_vhd> /o <enc_file> /p <password>\n";
+    MessageBoxW(NULL, msg.c_str(), L"encrypted-vhd-mount 帮助", MB_OK | MB_ICONINFORMATION);
+  }
+}
+// 显式确保 Dokan2 DLL 已加载；在延迟加载策略下，先尝试加载并输出清晰错误
+static bool ensureDokanLoaded() {
+  HMODULE h = GetModuleHandleW(L"dokan2.dll");
+  if (!h) h = LoadLibraryW(L"dokan2.dll");
+  if (!h) h = LoadLibraryW(L"C:\\Windows\\System32\\dokan2.dll");
+  if (!h) {
+    std::wcout << L"[main] 无法加载 dokan2.dll，请安装 Dokan v2 (x64) 或检查 DLL 版本\n";
+    return false;
+  }
+  return true;
 }
 
 static bool readParameters(Parameters &params, int argc, wchar_t **argv) {
@@ -88,6 +110,17 @@ static BOOL WINAPI CtrlHandler(DWORD dwCtrlType) {
 }
 
 int wmain(int argc, wchar_t **argv) {
+  // 若无控制台（例如双击运行），分配控制台以确保输出可见
+  if (GetConsoleWindow() == NULL) {
+    AllocConsole();
+    FILE *fp;
+    fp = freopen("CONOUT$", "w", stdout);
+    fp = freopen("CONOUT$", "w", stderr);
+    fp = freopen("CONIN$", "r", stdin);
+    (void)fp;
+  }
+  std::wcout << L"[main] starting. argc=" << argc << L"\n";
+  std::wcout.flush();
   Parameters params;
   if (!readParameters(params, argc, argv)) return 0;
 
@@ -121,7 +154,10 @@ int wmain(int argc, wchar_t **argv) {
 
   std::wcout << L"[main] encrypted opened. plaintext size=" << mountCtx.container().plaintextSize() << L" bytes\n";
   std::wcout << L"[main] exposing file name: " << mountCtx.config().exposedFileName << L"\n";
-
+  // 确保 Dokan2 DLL 已加载，避免在入口前静默退出
+  if (!ensureDokanLoaded()) {
+    return 1;
+  }
   DokanInit();
 
   DOKAN_OPTIONS dokanOptions; ZeroMemory(&dokanOptions, sizeof(DOKAN_OPTIONS));
