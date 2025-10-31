@@ -1,7 +1,8 @@
 .vs
 out
 build
-encrypted-vhd-mount\build
+encrypted-vhd-mount/build
+encrypted-vhd-mount/build-new/
 testvhd
 small-key.evhd
 small.vhd

@@ -7,6 +7,8 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#define NOMINMAX
+#include <Windows.h>
 
 #include "crypto.h"
 
@@ -76,6 +78,7 @@ private:
   std::wstring m_path;
   Header m_header{};
   std::fstream m_file;
+  HANDLE m_handle{INVALID_HANDLE_VALUE};
   std::mutex m_mutex;
   CryptoContext m_crypto;
   bool m_ready{false};
@@ -86,6 +89,9 @@ private:
   // v4 扩展：剪切填充指纹与盐（用于生成伪随机填充）
   uint8_t m_padSalt[16]{};
   uint32_t m_padCRC32{0};
+  // 原生偏移式I/O（Overlapped）辅助
+  bool readRawPhys(uint64_t physOffset, uint8_t *dst, size_t len);
+  bool writeRawPhys(uint64_t physOffset, const uint8_t *src, size_t len);
 };
 
 } // namespace evhd

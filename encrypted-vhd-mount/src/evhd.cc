@@ -84,14 +84,25 @@ bool Container::openEncrypted(const std::wstring &path, const std::wstring &pass
   if (!m_file.is_open()) { std::wcerr << L"[evhd] open file failed: " << path << std::endl; return false; }
 
   if (!readHeader()) { std::wcerr << L"[evhd] read header failed" << std::endl; return false; }
-  {
+
+  // 打开一个原生文件句柄以支持偏移式并发I/O
+  m_handle = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                         nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+  if (m_handle == INVALID_HANDLE_VALUE) {
+    if (m_debug) {
+      std::wcerr << L"[evhd] CreateFileW failed, err=" << GetLastError() << L"\n";
+    }
+    return false;
+  }
+
+  if (m_debug) {
     const wchar_t *kdfName = L"password";
     if (m_header.kdfMethod == 1) kdfName = L"keyfile";
     else if (m_header.kdfMethod == 2) kdfName = L"password+keyfile";
     std::wcerr << L"[evhd] header ok. plaintext size=" << m_header.originalSize
                << L" bytes, iterations=" << m_header.kdfIterations
                << L", kdfMethod=" << kdfName << L"\n";
-    // extra diagnostics: header version, payload offset, relocation entries count
     std::wcerr << L"[evhd] version=" << m_header.version
                << L" payloadOffset=" << m_payloadOffset
                << L" relocCount=" << m_relocations.size() << L"\n";
@@ -103,7 +114,6 @@ bool Container::openEncrypted(const std::wstring &path, const std::wstring &pass
                     << L" len=" << e.length
                     << L" phys=" << e.physicalOffset << L"\n";
       }
-      // Sanity check: flag entries beyond plaintext size
       size_t invalid = 0;
       for (size_t i = 0; i < m_relocations.size(); ++i) {
         const auto &e = m_relocations[i];
@@ -132,10 +142,12 @@ bool Container::openEncrypted(const std::wstring &path, const std::wstring &pass
   if (!m_crypto.init(password, p)) { std::wcerr << L"[evhd] crypto init failed" << std::endl; return false; }
 
   // Print KDF diagnostics: salt, nonce, and key prefix fingerprint
-  auto keyPrefix = m_crypto.keyPrefix8();
-  std::wcerr << L"[evhd] kdf salt=" << hexBytes(m_header.salt, sizeof(m_header.salt))
-             << L" nonce=" << hexBytes(m_header.nonce, sizeof(m_header.nonce))
-             << L" key[0..7]=" << hexBytes(keyPrefix.data(), keyPrefix.size()) << L"\n";
+  if (m_debug) {
+    auto keyPrefix = m_crypto.keyPrefix8();
+    std::wcerr << L"[evhd] kdf salt=" << hexBytes(m_header.salt, sizeof(m_header.salt))
+               << L" nonce=" << hexBytes(m_header.nonce, sizeof(m_header.nonce))
+               << L" key[0..7]=" << hexBytes(keyPrefix.data(), keyPrefix.size()) << L"\n";
+  }
 
   // Integrity check: validate pseudo-random pad fingerprint over cut ranges
   bool integrityOk = verifyIntegrity();
@@ -145,7 +157,7 @@ bool Container::openEncrypted(const std::wstring &path, const std::wstring &pass
     m_ready = false;
     return false;
   } else {
-    std::wcerr << L"[evhd] integrity check OK" << std::endl;
+    if (m_debug) std::wcerr << L"[evhd] integrity check OK" << std::endl;
   }
 
   m_ready = true;
@@ -464,28 +476,36 @@ bool Container::createFromPlainVhd(const std::wstring &plainVhdPath, const std::
 
 bool Container::readPlain(uint64_t offset, uint8_t *buffer, size_t length) {
   if (!m_ready || !buffer || length == 0) return false;
-  std::lock_guard<std::mutex> lock(m_mutex);
   if (m_debug) {
     std::wcerr << L"[evhd] readPlain offset=" << offset << L" len=" << length << L"\n";
   }
   // 将逻辑请求映射为一个或多个物理段
   std::vector<RelocEntry> segs; mapLogicalToPhysical(offset, length, segs);
+  // 合并相邻且物理/逻辑连续的段，减少 seek/read 次数
+  std::vector<RelocEntry> merged; merged.reserve(segs.size());
+  for (const auto &s : segs) {
+    if (!merged.empty()) {
+      auto &last = merged.back();
+      if (last.physicalOffset + last.length == s.physicalOffset &&
+          last.logicalOffset + last.length == s.logicalOffset) {
+        last.length += s.length;
+        continue;
+      }
+    }
+    merged.push_back(s);
+  }
   if (m_debug) {
-    std::wcerr << L"[evhd] segments count=" << segs.size() << L"\n";
-    for (size_t i = 0; i < segs.size(); ++i) {
-      const auto &s = segs[i];
+    std::wcerr << L"[evhd] segments count=" << segs.size() << L", merged=" << merged.size() << L"\n";
+    for (size_t i = 0; i < merged.size(); ++i) {
+      const auto &s = merged[i];
       std::wcerr << L"  seg[" << i << L"] logic=" << s.logicalOffset << L" phys=" << s.physicalOffset << L" len=" << s.length << L"\n";
     }
   }
   size_t bufPos = 0;
-  for (const auto &s : segs) {
-    // 清理流状态以防之前的失败导致 seek/read 无效
-    m_file.clear();
-    m_file.seekg(m_payloadOffset + s.physicalOffset, std::ios::beg);
-    m_file.read(reinterpret_cast<char*>(buffer + bufPos), s.length);
-    if (!m_file) {
+  for (const auto &s : merged) {
+    if (!readRawPhys(s.physicalOffset, buffer + bufPos, static_cast<size_t>(s.length))) {
       if (m_debug) {
-        std::wcerr << L"[evhd] read fail at phys=" << s.physicalOffset << L" len=" << s.length << L" payloadBase=" << m_payloadOffset << L"\n";
+        std::wcerr << L"[evhd] readRawPhys fail at phys=" << s.physicalOffset << L" len=" << s.length << L"\n";
       }
       return false;
     }
@@ -502,17 +522,27 @@ bool Container::readPlain(uint64_t offset, uint8_t *buffer, size_t length) {
 
 bool Container::writePlain(uint64_t offset, const uint8_t *buffer, size_t length) {
   if (!m_ready || !buffer || length == 0) return false;
-  std::lock_guard<std::mutex> lock(m_mutex);
   // 将逻辑写入拆分为物理段（重定位范围写入尾部）
   std::vector<RelocEntry> segs; mapLogicalToPhysical(offset, length, segs);
-  size_t bufPos = 0;
+  // 合并相邻且物理/逻辑连续的段，减少 seek/write 次数
+  std::vector<RelocEntry> merged; merged.reserve(segs.size());
   for (const auto &s : segs) {
-    std::vector<uint8_t> tmp(buffer + bufPos, buffer + bufPos + static_cast<size_t>(s.length));
+    if (!merged.empty()) {
+      auto &last = merged.back();
+      if (last.physicalOffset + last.length == s.physicalOffset &&
+          last.logicalOffset + last.length == s.logicalOffset) {
+        last.length += s.length;
+        continue;
+      }
+    }
+    merged.push_back(s);
+  }
+  size_t bufPos = 0;
+  std::vector<uint8_t> tmp; tmp.reserve(length);
+  for (const auto &s : merged) {
+    tmp.assign(buffer + bufPos, buffer + bufPos + static_cast<size_t>(s.length));
     if (!m_crypto.encryptRange(s.physicalOffset, tmp.data(), static_cast<size_t>(s.length))) return false;
-    m_file.clear();
-    m_file.seekp(m_payloadOffset + s.physicalOffset, std::ios::beg);
-    m_file.write(reinterpret_cast<const char*>(tmp.data()), static_cast<size_t>(s.length));
-    if (!m_file) return false;
+    if (!writeRawPhys(s.physicalOffset, tmp.data(), static_cast<size_t>(s.length))) return false;
     bufPos += static_cast<size_t>(s.length);
   }
   return true;
@@ -619,6 +649,7 @@ bool Container::writeHeader() {
 void Container::close() {
   m_ready = false;
   if (m_file.is_open()) m_file.close();
+  if (m_handle != INVALID_HANDLE_VALUE) { CloseHandle(m_handle); m_handle = INVALID_HANDLE_VALUE; }
 }
 
 // 将逻辑范围拆分为一个或多个物理段，以便读取/写入时正确应用CTR偏移
@@ -661,9 +692,11 @@ bool Container::verifyIntegrity() {
     return true;
   }
   // 诊断输出基础信息
-  std::wcerr << L"[evhd] integrity: payloadOffset=" << m_payloadOffset
-             << L" relocCount=" << m_relocations.size() << L" padSalt="
-             << hexBytes(m_padSalt, sizeof(m_padSalt)) << L"\n";
+  if (m_debug) {
+    std::wcerr << L"[evhd] integrity: payloadOffset=" << m_payloadOffset
+               << L" relocCount=" << m_relocations.size() << L" padSalt="
+               << hexBytes(m_padSalt, sizeof(m_padSalt)) << L"\n";
+  }
 
   // 以逻辑顺序处理所有剪切范围，逐段从主负载区读取并解密
   std::vector<RelocEntry> ranges = m_relocations;
@@ -681,18 +714,19 @@ bool Container::verifyIntegrity() {
       size_t take = static_cast<size_t>(std::min<uint64_t>(bufSize, e.length - processed));
       buf.assign(take, 0);
       // 读取主负载区（不应用重定位映射）：绝对文件偏移 = payloadOffset + 逻辑偏移
-      m_file.clear();
-      m_file.seekg(m_payloadOffset + e.logicalOffset + processed, std::ios::beg);
-      m_file.read(reinterpret_cast<char*>(buf.data()), take);
-      if (!m_file) {
-        std::wcerr << L"[evhd] integrity: read fail at logical=" << (e.logicalOffset + processed)
-                   << L" len=" << take << L"\n";
+      if (!readRawPhys(e.logicalOffset + processed, buf.data(), take)) {
+        if (m_debug) {
+          std::wcerr << L"[evhd] integrity: read fail at logical=" << (e.logicalOffset + processed)
+                     << L" len=" << take << L"\n";
+        }
         return false;
       }
       // 使用逻辑偏移作为CTR偏移进行解密（与创建时一致）
       if (!m_crypto.decryptRange(e.logicalOffset + processed, buf.data(), take)) {
-        std::wcerr << L"[evhd] integrity: decrypt fail at logical=" << (e.logicalOffset + processed)
-                   << L" len=" << take << L"\n";
+        if (m_debug) {
+          std::wcerr << L"[evhd] integrity: decrypt fail at logical=" << (e.logicalOffset + processed)
+                     << L" len=" << take << L"\n";
+        }
         return false;
       }
       // 累积CRC（创建时对伪随机填充的CRC应与此解密结果一致）
@@ -703,11 +737,68 @@ bool Container::verifyIntegrity() {
 
   uint32_t computed = crc ^ 0xFFFFFFFFU;
   if (computed != m_padCRC32) {
-    std::wcerr << L"[evhd] integrity: padCRC32 mismatch. expected=0x" << std::hex << m_padCRC32
-               << L" computed=0x" << computed << std::dec << L"\n";
+    if (m_debug) {
+      std::wcerr << L"[evhd] integrity: padCRC32 mismatch. expected=0x" << std::hex << m_padCRC32
+                 << L" computed=0x" << computed << std::dec << L"\n";
+    }
     return false;
   }
   return true;
+}
+ 
+// 原生偏移式I/O（Overlapped）辅助：在不改变文件指针的情况下按物理偏移读取
+bool Container::readRawPhys(uint64_t physOffset, uint8_t *dst, size_t len) {
+  if (m_handle == INVALID_HANDLE_VALUE) return false;
+  OVERLAPPED ov{};
+  ULONGLONG pos = m_payloadOffset + physOffset;
+  ov.Offset     = static_cast<DWORD>(pos & 0xFFFFFFFFULL);
+  ov.OffsetHigh = static_cast<DWORD>(pos >> 32);
+  HANDLE hEvt = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (!hEvt) return false;
+  ov.hEvent = hEvt;
+  DWORD want = static_cast<DWORD>(len);
+  DWORD done = 0;
+  BOOL ok = ReadFile(m_handle, dst, want, nullptr, &ov);
+  if (!ok) {
+    DWORD err = GetLastError();
+    if (err == ERROR_IO_PENDING) {
+      ok = GetOverlappedResult(m_handle, &ov, &done, TRUE);
+    } else {
+      CloseHandle(hEvt);
+      return false;
+    }
+  } else {
+    done = want; // synchronous path
+  }
+  CloseHandle(hEvt);
+  return ok && done == want;
+}
+
+bool Container::writeRawPhys(uint64_t physOffset, const uint8_t *src, size_t len) {
+  if (m_handle == INVALID_HANDLE_VALUE) return false;
+  OVERLAPPED ov{};
+  ULONGLONG pos = m_payloadOffset + physOffset;
+  ov.Offset     = static_cast<DWORD>(pos & 0xFFFFFFFFULL);
+  ov.OffsetHigh = static_cast<DWORD>(pos >> 32);
+  HANDLE hEvt = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (!hEvt) return false;
+  ov.hEvent = hEvt;
+  DWORD want = static_cast<DWORD>(len);
+  DWORD done = 0;
+  BOOL ok = WriteFile(m_handle, src, want, nullptr, &ov);
+  if (!ok) {
+    DWORD err = GetLastError();
+    if (err == ERROR_IO_PENDING) {
+      ok = GetOverlappedResult(m_handle, &ov, &done, TRUE);
+    } else {
+      CloseHandle(hEvt);
+      return false;
+    }
+  } else {
+    done = want; // synchronous path
+  }
+  CloseHandle(hEvt);
+  return ok && done == want;
 }
 
 } // namespace evhd

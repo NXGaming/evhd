@@ -219,36 +219,55 @@ bool CryptoContext::aesCtrCrypt(uint64_t fileOffset, uint8_t *buffer, size_t len
   if (length == 0) return true;
 
   // CTR: keystream = AES(IV+counter) under ECB, XOR with plaintext/ciphertext
+  // 优化：一次生成多个连续块的 keystream，减少 BCryptEncrypt 调用。
   size_t processed = 0;
   uint64_t blockIndex = fileOffset / 16;
   size_t blockOffset = (size_t)(fileOffset % 16);
 
+  // 每批次最多生成的块数（64KB keystream）
+  const size_t maxBlocksPerBatch = 4096; // 4096 * 16 = 65536 bytes
+  std::vector<uint8_t> ivs; ivs.reserve(maxBlocksPerBatch * 16);
+  std::vector<uint8_t> ks;  ks.reserve(maxBlocksPerBatch * 16);
+
   while (processed < length) {
-    std::vector<uint8_t> iv;
-    // IV with current counter
-    uint64_t offsetForIv = (blockIndex * 16);
-    makeIV(offsetForIv, iv);
+    size_t remaining = length - processed;
+    // 需要的块数：覆盖当前剩余数据，加上首块偏移
+    size_t blocksNeeded = (blockOffset + remaining + 15) / 16;
+    size_t blocks = std::min(blocksNeeded, maxBlocksPerBatch);
 
-    uint8_t ks[16] = {0};
+    // 构造连续的 IV 序列：nonce[0..7] + counter(blockIndex + i)
+    ivs.resize(blocks * 16);
+    for (size_t b = 0; b < blocks; ++b) {
+      // nonce 前8字节
+      memcpy(ivs.data() + b * 16, m_nonce.data(), 8);
+      // counter 为 64-bit 小端（与原实现 memcpy 一致）
+      uint64_t ctr = blockIndex + b;
+      memcpy(ivs.data() + b * 16 + 8, &ctr, sizeof(ctr));
+    }
+
+    // 批量 ECB 加密，得到 keystream blocks
+    ks.resize(blocks * 16);
     ULONG outLen = 0;
-    // Encrypt IV under ECB to produce keystream block
-    NTSTATUS status = BCryptEncrypt(m_aesKey,
-                                    iv.data(), (ULONG)iv.size(),
-                                    nullptr,
-                                    nullptr, 0,
-                                    ks, (ULONG)sizeof(ks), &outLen,
-                                    0);
-    if (status != 0 || outLen != sizeof(ks)) return false;
+    NTSTATUS status = BCryptEncrypt(
+        m_aesKey,
+        ivs.data(), (ULONG)ivs.size(),
+        nullptr,
+        nullptr, 0,
+        ks.data(), (ULONG)ks.size(), &outLen,
+        0);
+    if (status != 0 || outLen != ks.size()) return false;
 
-    // Determine how many bytes from this block
-    size_t take = std::min<size_t>(length - processed, 16 - blockOffset);
+    // 从 keystream 中应用到当前待处理数据
+    size_t keystreamOffset = blockOffset;
+    size_t available = ks.size() - keystreamOffset;
+    size_t take = std::min(available, remaining);
     for (size_t i = 0; i < take; ++i) {
-      buffer[processed + i] ^= ks[blockOffset + i];
+      buffer[processed + i] ^= ks[keystreamOffset + i];
     }
 
     processed += take;
-    blockIndex += 1;
-    blockOffset = 0; // after first partial block, no offset
+    blockIndex += blocks;
+    blockOffset = 0; // 首批处理后，后续批次从块边界开始
   }
 
   return true;

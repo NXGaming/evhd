@@ -14,18 +14,26 @@ namespace vfs_evhd {
 
 bool MountContext::setup(const MountConfig &cfg) {
   m_cfg = cfg;
-  std::wcerr << L"[vfs] MountContext.setup enc=" << cfg.encryptedFilePath << L"\n";
-  std::wcerr << L"[vfs] keyfile=" << (cfg.keyFilePath.empty() ? L"(none)" : cfg.keyFilePath) << L"\n";
+  if (m_cfg.debug) {
+    std::wcerr << L"[vfs] MountContext.setup enc=" << cfg.encryptedFilePath << L"\n";
+    std::wcerr << L"[vfs] keyfile=" << (cfg.keyFilePath.empty() ? L"(none)" : cfg.keyFilePath) << L"\n";
+  }
   bool ok = m_container.openEncrypted(cfg.encryptedFilePath, cfg.password, cfg.keyFilePath);
-  std::wcerr << L"[vfs] openEncrypted result=" << (ok ? L"ok" : L"fail") << L"\n";
+  if (m_cfg.debug) {
+    std::wcerr << L"[vfs] openEncrypted result=" << (ok ? L"ok" : L"fail") << L"\n";
+  }
   if (ok) {
     m_container.setDebug(cfg.debug);
     // If container carries original filename metadata, expose it
     if (!m_container.originalName().empty()) {
       m_cfg.exposedFileName = m_container.originalName();
-      std::wcerr << L"[vfs] exposed name from metadata: " << m_cfg.exposedFileName << L"\n";
+      if (m_cfg.debug) {
+        std::wcerr << L"[vfs] exposed name from metadata: " << m_cfg.exposedFileName << L"\n";
+      }
     } else {
-      std::wcerr << L"[vfs] no metadata filename, using default: " << m_cfg.exposedFileName << L"\n";
+      if (m_cfg.debug) {
+        std::wcerr << L"[vfs] no metadata filename, using default: " << m_cfg.exposedFileName << L"\n";
+      }
     }
   }
   return ok;
@@ -47,7 +55,9 @@ static NTSTATUS DOKAN_CALLBACK createfile(
     PDOKAN_FILE_INFO dokanfileinfo) {
   auto ctx = utils::getContext(dokanfileinfo);
   std::wstring path(filename);
-  std::wcerr << L"[dokan] ZwCreateFile path=" << path << L" desired=0x" << std::hex << desiredaccess << std::dec << L"\n";
+  if (ctx->config().debug) {
+    std::wcerr << L"[dokan] ZwCreateFile path=" << path << L" desired=0x" << std::hex << desiredaccess << std::dec << L"\n";
+  }
 
   if (utils::isRoot(path)) {
     dokanfileinfo->IsDirectory = TRUE;
@@ -66,12 +76,18 @@ static NTSTATUS DOKAN_CALLBACK createfile(
   return STATUS_OBJECT_NAME_NOT_FOUND;
 }
 
-static void DOKAN_CALLBACK cleanup(LPCWSTR filename, PDOKAN_FILE_INFO) {
-  std::wcerr << L"[dokan] Cleanup path=" << filename << L"\n";
+static void DOKAN_CALLBACK cleanup(LPCWSTR filename, PDOKAN_FILE_INFO dokanfileinfo) {
+  auto ctx = utils::getContext(dokanfileinfo);
+  if (ctx->config().debug) {
+    std::wcerr << L"[dokan] Cleanup path=" << filename << L"\n";
+  }
 }
 
-static void DOKAN_CALLBACK closefile(LPCWSTR filename, PDOKAN_FILE_INFO) {
-  std::wcerr << L"[dokan] CloseFile path=" << filename << L"\n";
+static void DOKAN_CALLBACK closefile(LPCWSTR filename, PDOKAN_FILE_INFO dokanfileinfo) {
+  auto ctx = utils::getContext(dokanfileinfo);
+  if (ctx->config().debug) {
+    std::wcerr << L"[dokan] CloseFile path=" << filename << L"\n";
+  }
 }
 
 static NTSTATUS DOKAN_CALLBACK readfile(LPCWSTR filename, LPVOID buffer, DWORD bufferlength,
@@ -79,7 +95,9 @@ static NTSTATUS DOKAN_CALLBACK readfile(LPCWSTR filename, LPVOID buffer, DWORD b
                                         PDOKAN_FILE_INFO dokanfileinfo) {
   auto ctx = utils::getContext(dokanfileinfo);
   std::wstring path(filename);
-  std::wcerr << L"[dokan] ReadFile path=" << path << L" offset=" << offset << L" len=" << bufferlength << L"\n";
+  if (ctx->config().debug) {
+    std::wcerr << L"[dokan] ReadFile path=" << path << L" offset=" << offset << L" len=" << bufferlength << L"\n";
+  }
 
   if (path == (L"\\" + ctx->config().exposedFileName)) {
     size_t len = (size_t)bufferlength;
@@ -108,7 +126,9 @@ static NTSTATUS DOKAN_CALLBACK writefile(LPCWSTR filename, LPCVOID buffer, DWORD
                                          PDOKAN_FILE_INFO dokanfileinfo) {
   auto ctx = utils::getContext(dokanfileinfo);
   std::wstring path(filename);
-  std::wcerr << L"[dokan] WriteFile path=" << path << L" offset=" << offset << L" len=" << numberofbytesToWrite << L"\n";
+  if (ctx->config().debug) {
+    std::wcerr << L"[dokan] WriteFile path=" << path << L" offset=" << offset << L" len=" << numberofbytesToWrite << L"\n";
+  }
 
   if (path == (L"\\" + ctx->config().exposedFileName)) {
     size_t len = (size_t)numberofbytesToWrite;
@@ -134,7 +154,9 @@ static NTSTATUS DOKAN_CALLBACK getfileInformation(LPCWSTR filename, LPBY_HANDLE_
                                                   PDOKAN_FILE_INFO dokanfileinfo) {
   auto ctx = utils::getContext(dokanfileinfo);
   std::wstring path(filename);
-  std::wcerr << L"[dokan] GetFileInformation path=" << path << L"\n";
+  if (ctx->config().debug) {
+    std::wcerr << L"[dokan] GetFileInformation path=" << path << L"\n";
+  }
 
   if (utils::isRoot(path)) {
     info->dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY;
@@ -162,7 +184,9 @@ static NTSTATUS DOKAN_CALLBACK findfiles(LPCWSTR filename, PFillFindData fill_fi
                                          PDOKAN_FILE_INFO dokanfileinfo) {
   auto ctx = utils::getContext(dokanfileinfo);
   std::wstring path(filename);
-  std::wcerr << L"[dokan] FindFiles path=" << path << L"\n";
+  if (ctx->config().debug) {
+    std::wcerr << L"[dokan] FindFiles path=" << path << L"\n";
+  }
 
   if (!utils::isRoot(path)) {
     return STATUS_OBJECT_PATH_NOT_FOUND;
@@ -183,7 +207,9 @@ static NTSTATUS DOKAN_CALLBACK getdiskfreespace(PULONGLONG free_bytes_available,
                                                 PULONGLONG total_number_of_free_bytes,
                                                 PDOKAN_FILE_INFO dokanfileinfo) {
   auto ctx = utils::getContext(dokanfileinfo);
-  std::wcerr << L"[dokan] GetDiskFreeSpace" << L"\n";
+  if (ctx->config().debug) {
+    std::wcerr << L"[dokan] GetDiskFreeSpace" << L"\n";
+  }
   uint64_t size = ctx->container().plaintextSize();
   *total_number_of_bytes = size;
   *free_bytes_available = 0;
@@ -198,6 +224,7 @@ static NTSTATUS DOKAN_CALLBACK getvolumeinformation(LPWSTR volumename_buffer, DW
                                                     LPWSTR filesystem_name_buffer,
                                                     DWORD filesystem_name_size,
                                                     PDOKAN_FILE_INFO dokanfileinfo) {
+  auto ctx = utils::getContext(dokanfileinfo);
   std::wstring vn = L"EVHD Mount";
   wcsncpy_s(volumename_buffer, volumename_size, vn.c_str(), _TRUNCATE);
   *volume_serialnumber = 0xE1E4D001;
@@ -206,7 +233,9 @@ static NTSTATUS DOKAN_CALLBACK getvolumeinformation(LPWSTR volumename_buffer, DW
   *filesystem_flags = FILE_CASE_PRESERVED_NAMES | FILE_SUPPORTS_REPARSE_POINTS | FILE_SUPPORTS_SPARSE_FILES;
   std::wstring fsn = L"EVHDFS";
   wcsncpy_s(filesystem_name_buffer, filesystem_name_size, fsn.c_str(), _TRUNCATE);
-  std::wcerr << L"[dokan] GetVolumeInformation" << L"\n";
+  if (ctx->config().debug) {
+    std::wcerr << L"[dokan] GetVolumeInformation" << L"\n";
+  }
   return STATUS_SUCCESS;
 }
 
