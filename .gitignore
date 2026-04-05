@@ -15,3 +15,10 @@ encrypted-vhd-mount/bench_*.evhd
 encrypted-vhd-mount/bench_*.vhd
 
 installer/EncryptedVHDMount-Setup.exe
+a.txt
+.gitignore
+test.vhd
+.vscode/settings.json
+.vscode/tasks.json
+tmp*
+test.evhd

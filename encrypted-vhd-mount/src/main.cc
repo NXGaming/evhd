@@ -10,6 +10,8 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
+#include <vector>
 
 #include "vfs_evhd.h"
 
@@ -22,20 +24,77 @@ struct Parameters {
   bool launchMountPath{false};
   std::wstring keyFilePath; // optional key file
   bool directIO{false};      // disable OS cache, use unbuffered I/O
+  bool passwordFromStdin{false};
 };
+
+static bool utf8ToWide(const std::vector<char> &input, std::wstring &out) {
+  out.clear();
+  if (input.empty()) return true;
+
+  int chars = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                  input.data(), static_cast<int>(input.size()),
+                                  nullptr, 0);
+  if (chars <= 0) return false;
+
+  out.resize(chars);
+  return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                             input.data(), static_cast<int>(input.size()),
+                             out.data(), chars) == chars;
+}
+
+static bool readPasswordFromStdin(std::wstring &password) {
+  password.clear();
+  HANDLE stdinHandle = GetStdHandle(STD_INPUT_HANDLE);
+  if (stdinHandle == INVALID_HANDLE_VALUE || stdinHandle == nullptr) {
+    return false;
+  }
+
+  constexpr size_t maxPasswordBytes = 1 << 20;
+  std::vector<char> bytes;
+  bytes.reserve(256);
+
+  char chunk[256];
+  bool sawLineEnding = false;
+  while (!sawLineEnding && bytes.size() < maxPasswordBytes) {
+    DWORD read = 0;
+    if (!ReadFile(stdinHandle, chunk, sizeof(chunk), &read, nullptr)) {
+      return false;
+    }
+    if (read == 0) break;
+
+    for (DWORD i = 0; i < read; ++i) {
+      char ch = chunk[i];
+      if (ch == '\n') {
+        sawLineEnding = true;
+        break;
+      }
+      if (ch != '\r') {
+        bytes.push_back(ch);
+        if (bytes.size() == maxPasswordBytes) break;
+      }
+    }
+  }
+
+  if (bytes.empty()) {
+    return false;
+  }
+
+  return utf8ToWide(bytes, password);
+}
 
 static void showUsage() {
   std::wcout << L"encrypted-vhd-mount: AES-256-CTR encrypt VHD, mount decrypted view via Dokan\n";
   std::wcout << L"Usage:\n";
-  std::wcout << L"  encrypted-vhd-mount.exe [/d|/l] /p <password> <enc_file> <mount_path>\n";
+  std::wcout << L"  encrypted-vhd-mount.exe [/d|/l] [/p <password> | --password-stdin] <enc_file> <mount_path>\n";
   std::wcout << L"  Optional: /k <keyfile> participate in key derivation\n";
   std::wcout << L"  Optional: /direct disable file cache, use unbuffered direct I/O (needs alignment)\n";
   std::wcout << L"  Initialize encrypted file:\n";
-  std::wcout << L"  encrypted-vhd-mount.exe /init <plain_vhd> /o <enc_file> /p <password>\n";
+  std::wcout << L"  encrypted-vhd-mount.exe /init <plain_vhd> /o <enc_file> [/p <password> | --password-stdin]\n";
   std::wcout << L"Args:\n";
   std::wcout << L"  /d           print Dokan debug logs\n";
   std::wcout << L"  /l           open Explorer at mount path after mount\n";
   std::wcout << L"  /p           plaintext password\n";
+  std::wcout << L"  --password-stdin  read UTF-8 password from stdin\n";
   std::wcout << L"  /k           key file path\n";
   std::wcout << L"  /init        initialize from plaintext VHD\n";
   std::wcout << L"  /o           output encrypted file path\n";
@@ -54,15 +113,18 @@ static bool ensureDokanLoaded() {
 }
 
 static bool readParameters(Parameters &params, int argc, wchar_t **argv) {
+  bool usedPasswordArg = false;
   for (int i = 1; i < argc; ++i) {
     std::wstring arg = argv[i];
     if (arg == L"/h" || arg == L"--help") { showUsage(); return false; }
     else if (arg == L"/d" || arg == L"--debug") { params.debugMode = true; }
     else if (arg == L"/l" || arg == L"--launch") { params.launchMountPath = true; }
     else if (arg == L"/direct" || arg == L"--direct") { params.directIO = true; }
+    else if (arg == L"--password-stdin") { params.passwordFromStdin = true; }
     else if (arg == L"/p" || arg == L"--password") { 
       if (i + 1 >= argc) { std::wcout << L"Missing password\n"; return false; } 
       params.password = argv[++i]; 
+      usedPasswordArg = true;
     }
     else if (arg == L"/k" || arg == L"--keyfile") { 
       if (i + 1 >= argc) { std::wcout << L"Missing keyfile path\n"; return false; } 
@@ -79,7 +141,7 @@ static bool readParameters(Parameters &params, int argc, wchar_t **argv) {
     else {
       // positional args: <enc_file> <mount_path>
       if (params.encFilePath.empty()) {
-        params.encFilePath = arg; 
+        params.encFilePath = arg;
       } else if (params.mountPoint.empty()) {
         params.mountPoint = arg; 
       } else { 
@@ -89,17 +151,26 @@ static bool readParameters(Parameters &params, int argc, wchar_t **argv) {
     }
   }
 
+  if (usedPasswordArg && params.passwordFromStdin) {
+    std::wcout << L"Choose only one password source\n";
+    return false;
+  }
+  if (params.passwordFromStdin && !readPasswordFromStdin(params.password)) {
+    std::wcout << L"Failed to read UTF-8 password from stdin\n";
+    return false;
+  }
+
   if (!params.initVhdPath.empty()) {
     if (params.encFilePath.empty()) { std::wcout << L"Init mode needs /o <enc_file>\n"; return false; }
     if (params.password.empty() && params.keyFilePath.empty()) { 
-      std::wcout << L"Init mode needs /p <password> or /k <keyfile>\n"; 
+      std::wcout << L"Init mode needs /p <password>, --password-stdin or /k <keyfile>\n";
       return false; 
     }
     return true;
   }
 
   if (params.password.empty() && params.keyFilePath.empty()) { 
-    std::wcout << L"Missing /p <password> or /k <keyfile>\n"; 
+    std::wcout << L"Missing /p <password>, --password-stdin or /k <keyfile>\n";
     return false; 
   }
   if (params.encFilePath.empty()) { std::wcout << L"Missing <enc_file>\n"; return false; }
@@ -107,11 +178,25 @@ static bool readParameters(Parameters &params, int argc, wchar_t **argv) {
   return true;
 }
 
+static bool isRedirectedHandle(HANDLE handle) {
+  if (handle == INVALID_HANDLE_VALUE || handle == nullptr) {
+    return false;
+  }
+
+  DWORD mode = 0;
+  if (GetConsoleMode(handle, &mode)) {
+    return false;
+  }
+
+  DWORD type = GetFileType(handle);
+  return type == FILE_TYPE_PIPE || type == FILE_TYPE_DISK;
+}
+
 static void fileWatcher(std::wstring path) {
   std::filesystem::path mp(path);
   std::error_code ec;
-  do { 
-    std::this_thread::sleep_for(std::chrono::milliseconds(50)); 
+  do {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
   } while (std::filesystem::exists(mp, ec) == false);
   ShellExecuteW(0, L"explore", path.c_str(), NULL, NULL, SW_SHOWNORMAL);
 }
@@ -125,14 +210,26 @@ static BOOL WINAPI CtrlHandler(DWORD dwCtrlType) {
     case CTRL_SHUTDOWN_EVENT:
       SetConsoleCtrlHandler(CtrlHandler, FALSE);
       return TRUE;
-    default: 
+    default:
       return FALSE;
   }
 }
 
 int wmain(int argc, wchar_t **argv) {
-  // Allocate console if none exists (e.g., double-click run)
-  if (GetConsoleWindow() == NULL) {
+  const bool stdinRedirected = isRedirectedHandle(GetStdHandle(STD_INPUT_HANDLE));
+  const bool stdoutRedirected = isRedirectedHandle(GetStdHandle(STD_OUTPUT_HANDLE));
+  const bool stderrRedirected = isRedirectedHandle(GetStdHandle(STD_ERROR_HANDLE));
+
+  // Allocate console only for interactive double-click scenarios.
+  // Preserve redirected stdio handles from parent processes.
+  if (GetConsoleWindow() == NULL && !stdinRedirected && !stdoutRedirected && !stderrRedirected) {
+  const bool stdinRedirected = isRedirectedHandle(GetStdHandle(STD_INPUT_HANDLE));
+  const bool stdoutRedirected = isRedirectedHandle(GetStdHandle(STD_OUTPUT_HANDLE));
+  const bool stderrRedirected = isRedirectedHandle(GetStdHandle(STD_ERROR_HANDLE));
+
+  // Allocate console only for interactive double-click scenarios.
+  // Preserve redirected stdio handles from parent processes.
+  if (GetConsoleWindow() == NULL && !stdinRedirected && !stdoutRedirected && !stderrRedirected) {
     AllocConsole();
     FILE *fp;
     fp = freopen("CONOUT$", "w", stdout);
@@ -187,7 +284,7 @@ int wmain(int argc, wchar_t **argv) {
   }
   DokanInit();
 
-  DOKAN_OPTIONS dokanOptions; 
+  DOKAN_OPTIONS dokanOptions;
   ZeroMemory(&dokanOptions, sizeof(DOKAN_OPTIONS));
   dokanOptions.Version = DOKAN_VERSION;
   dokanOptions.SingleThread = FALSE;
@@ -195,12 +292,12 @@ int wmain(int argc, wchar_t **argv) {
   dokanOptions.GlobalContext = reinterpret_cast<ULONG64>(&mountCtx);
   dokanOptions.MountPoint = params.mountPoint.c_str();
   dokanOptions.Options |= DOKAN_OPTION_CURRENT_SESSION | DOKAN_OPTION_ALT_STREAM | DOKAN_OPTION_MOUNT_MANAGER;
-  
+
   if (params.debugMode) {
     dokanOptions.Options |= DOKAN_OPTION_STDERR | DOKAN_OPTION_DEBUG;
   }
 
-  DOKAN_OPERATIONS ops; 
+  DOKAN_OPERATIONS ops;
   ZeroMemory(&ops, sizeof(DOKAN_OPERATIONS));
   vfs_evhd::setup_dokan_ops(ops);
 

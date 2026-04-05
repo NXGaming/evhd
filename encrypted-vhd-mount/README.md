@@ -24,11 +24,11 @@ cmake --build . --config Release
 将明文VHD加密为EVHD文件（包含头部、盐值与随机IV），加密为流式进行，无需一次性加载整文件。
 
 ```powershell
-encrypted-vhd-mount.exe /init c:\path\to\plain.vhd /o c:\path\to\encrypted.evhd /p "YourPassword"
+"YourPassword" | encrypted-vhd-mount.exe /init c:\path\to\plain.vhd /o c:\path\to\encrypted.evhd --password-stdin
 # 仅密钥文件：
 encrypted-vhd-mount.exe /init c:\path\to\plain.vhd /o c:\path\to\encrypted.evhd /k c:\path\to\keyfile.bin
 # 密码 + 密钥文件组合：
-encrypted-vhd-mount.exe /init c:\path\to\plain.vhd /o c:\path\to\encrypted.evhd /p "YourPassword" /k c:\path\to\keyfile.bin
+"YourPassword" | encrypted-vhd-mount.exe /init c:\path\to\plain.vhd /o c:\path\to\encrypted.evhd --password-stdin /k c:\path\to\keyfile.bin
 ```
 
 ### 挂载解密视图
@@ -36,16 +36,17 @@ encrypted-vhd-mount.exe /init c:\path\to\plain.vhd /o c:\path\to\encrypted.evhd 
 将加密文件通过Dokan挂载为一个虚拟盘，盘内包含一个文件 `decrypted.vhd`，其内容为对加密文件的解密视图：
 
 ```powershell
-encrypted-vhd-mount.exe /p "YourPassword" c:\path\to\encrypted.evhd M:\
+"YourPassword" | encrypted-vhd-mount.exe --password-stdin c:\path\to\encrypted.evhd M:\
 # 仅密钥文件：
 encrypted-vhd-mount.exe /k c:\path\to\keyfile.bin c:\path\to\encrypted.evhd M:\
 # 密码 + 密钥文件组合：
-encrypted-vhd-mount.exe /p "YourPassword" /k c:\path\to\keyfile.bin c:\path\to\encrypted.evhd M:\
+"YourPassword" | encrypted-vhd-mount.exe --password-stdin /k c:\path\to\keyfile.bin c:\path\to\encrypted.evhd M:\
 # 启用 directIO 模式（提升性能）：
-encrypted-vhd-mount.exe /p "YourPassword" /direct c:\path\to\encrypted.evhd M:\
+"YourPassword" | encrypted-vhd-mount.exe --password-stdin /direct c:\path\to\encrypted.evhd M:\
 ```
 
 - 可选：`/d` 显示Dokan调试日志；`/l` 挂载后打开资源管理器；`/direct` 启用 directIO 模式。
+- 推荐使用 `--password-stdin` 从 stdin 读取 UTF-8 密码；`/p <password>` 仍可用于兼容场景。
 - `M:\` 可以是盘符或NTFS文件夹路径。
 - 若容器头部包含原始文件名元数据，则挂载盘内文件名会显示为该原始名；否则默认展示为 `decrypted.vhd`。
 
