@@ -223,13 +223,6 @@ int wmain(int argc, wchar_t **argv) {
   // Allocate console only for interactive double-click scenarios.
   // Preserve redirected stdio handles from parent processes.
   if (GetConsoleWindow() == NULL && !stdinRedirected && !stdoutRedirected && !stderrRedirected) {
-  const bool stdinRedirected = isRedirectedHandle(GetStdHandle(STD_INPUT_HANDLE));
-  const bool stdoutRedirected = isRedirectedHandle(GetStdHandle(STD_OUTPUT_HANDLE));
-  const bool stderrRedirected = isRedirectedHandle(GetStdHandle(STD_ERROR_HANDLE));
-
-  // Allocate console only for interactive double-click scenarios.
-  // Preserve redirected stdio handles from parent processes.
-  if (GetConsoleWindow() == NULL && !stdinRedirected && !stdoutRedirected && !stderrRedirected) {
     AllocConsole();
     FILE *fp;
     fp = freopen("CONOUT$", "w", stdout);
