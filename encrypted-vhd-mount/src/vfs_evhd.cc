@@ -14,6 +14,8 @@ namespace vfs_evhd {
 
 bool MountContext::setup(const MountConfig &cfg) {
   m_cfg = cfg;
+  m_container.setDebug(cfg.debug);
+  m_container.setUnbuffered(cfg.directIO);
   if (m_cfg.debug) {
     std::wcerr << L"[vfs] MountContext.setup enc=" << cfg.encryptedFilePath << L"\n";
     std::wcerr << L"[vfs] keyfile=" << (cfg.keyFilePath.empty() ? L"(none)" : cfg.keyFilePath) << L"\n";
@@ -23,8 +25,6 @@ bool MountContext::setup(const MountConfig &cfg) {
     std::wcerr << L"[vfs] openEncrypted result=" << (ok ? L"ok" : L"fail") << L"\n";
   }
   if (ok) {
-    m_container.setDebug(cfg.debug);
-    m_container.setUnbuffered(cfg.directIO);
     // If container carries original filename metadata, expose it
     if (!m_container.originalName().empty()) {
       m_cfg.exposedFileName = m_container.originalName();
@@ -151,6 +151,25 @@ static NTSTATUS DOKAN_CALLBACK writefile(LPCWSTR filename, LPCVOID buffer, DWORD
   return STATUS_OBJECT_NAME_NOT_FOUND;
 }
 
+static NTSTATUS DOKAN_CALLBACK flushfilebuffers(LPCWSTR filename,
+                                                PDOKAN_FILE_INFO dokanfileinfo) {
+  auto ctx = utils::getContext(dokanfileinfo);
+  if (ctx->config().debug) {
+    std::wcerr << L"[dokan] FlushFileBuffers path=" << filename << L"\n";
+  }
+
+  std::wstring path(filename);
+  if (utils::isRoot(path)) {
+    return STATUS_SUCCESS;
+  }
+
+  if (path == (L"\\" + ctx->config().exposedFileName)) {
+    return ctx->container().flush() ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+  }
+
+  return STATUS_OBJECT_NAME_NOT_FOUND;
+}
+
 static NTSTATUS DOKAN_CALLBACK getfileInformation(LPCWSTR filename, LPBY_HANDLE_FILE_INFORMATION info,
                                                   PDOKAN_FILE_INFO dokanfileinfo) {
   auto ctx = utils::getContext(dokanfileinfo);
@@ -247,6 +266,7 @@ void setup_dokan_ops(DOKAN_OPERATIONS &ops) {
   ops.CloseFile = closefile;
   ops.ReadFile = readfile;
   ops.WriteFile = writefile;
+  ops.FlushFileBuffers = flushfilebuffers;
   ops.GetFileInformation = getfileInformation;
   ops.FindFiles = findfiles;
   ops.GetDiskFreeSpace = getdiskfreespace;

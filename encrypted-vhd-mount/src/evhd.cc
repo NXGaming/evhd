@@ -77,19 +77,70 @@ static uint32_t crc32_update(uint32_t crc, const uint8_t *data, size_t len) {
   return crc;
 }
 
+constexpr const char JOURNAL_MAGIC[8] = {'E','V','J','N','0','0','0','1'};
+constexpr uint32_t JOURNAL_VERSION = 1;
+constexpr uint32_t JOURNAL_STATE_CLEAN = 0;
+constexpr uint32_t JOURNAL_STATE_PREPARED = 1;
+
+static bool readHandleExact(HANDLE handle, uint64_t offset, void *buffer, size_t len) {
+  LARGE_INTEGER pos{};
+  pos.QuadPart = static_cast<LONGLONG>(offset);
+  if (!SetFilePointerEx(handle, pos, nullptr, FILE_BEGIN)) return false;
+  size_t doneTotal = 0;
+  while (doneTotal < len) {
+    DWORD done = 0;
+    DWORD want = static_cast<DWORD>(std::min<size_t>(len - doneTotal, 1u << 20));
+    if (!ReadFile(handle, static_cast<uint8_t *>(buffer) + doneTotal, want, &done, nullptr)) return false;
+    if (done != want) return false;
+    doneTotal += done;
+  }
+  return true;
+}
+
+static bool writeHandleExact(HANDLE handle, uint64_t offset, const void *buffer, size_t len) {
+  LARGE_INTEGER pos{};
+  pos.QuadPart = static_cast<LONGLONG>(offset);
+  if (!SetFilePointerEx(handle, pos, nullptr, FILE_BEGIN)) return false;
+  size_t doneTotal = 0;
+  while (doneTotal < len) {
+    DWORD done = 0;
+    DWORD want = static_cast<DWORD>(std::min<size_t>(len - doneTotal, 1u << 20));
+    if (!WriteFile(handle, static_cast<const uint8_t *>(buffer) + doneTotal, want, &done, nullptr)) return false;
+    if (done != want) return false;
+    doneTotal += done;
+  }
+  return true;
+}
+
+static bool resizeHandle(HANDLE handle, uint64_t size) {
+  LARGE_INTEGER pos{};
+  pos.QuadPart = static_cast<LONGLONG>(size);
+  if (!SetFilePointerEx(handle, pos, nullptr, FILE_BEGIN)) return false;
+  return !!SetEndOfFile(handle);
+}
+
+static uint64_t getHandleSize(HANDLE handle) {
+  LARGE_INTEGER size{};
+  if (!GetFileSizeEx(handle, &size)) return 0;
+  return static_cast<uint64_t>(size.QuadPart);
+}
+
 bool Container::openEncrypted(const std::wstring &path, const std::wstring &password,
                               const std::wstring &keyFilePath) {
+  std::lock_guard<std::recursive_mutex> lg(m_mutex);
   close();
   m_path = path;
+  m_previousSessionDirty = false;
+  m_recoveredPendingJournal = false;
   m_file.open(path.c_str(), std::ios::binary | std::ios::in | std::ios::out);
   if (!m_file.is_open()) { std::wcerr << L"[evhd] open file failed: " << path << std::endl; return false; }
 
   if (!readHeader()) { std::wcerr << L"[evhd] read header failed" << std::endl; return false; }
 
   // 打开一个原生文件句柄以支持偏移式并发I/O
-  DWORD flags = FILE_FLAG_OVERLAPPED;
+  DWORD flags = FILE_FLAG_OVERLAPPED | FILE_FLAG_WRITE_THROUGH;
   if (m_unbuffered) {
-    flags |= FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH;
+    flags |= FILE_FLAG_NO_BUFFERING;
   }
   m_handle = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
                          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -173,6 +224,18 @@ bool Container::openEncrypted(const std::wstring &path, const std::wstring &pass
     }
   }
 
+  if (!openJournal()) {
+    std::wcerr << L"[evhd] open journal failed" << std::endl;
+    return false;
+  }
+
+  if (m_previousSessionDirty) {
+    std::wcerr << L"[evhd] journal: detected previous unclean shutdown" << std::endl;
+  }
+  if (m_recoveredPendingJournal) {
+    std::wcerr << L"[evhd] journal: recovered pending write transaction" << std::endl;
+  }
+
   CryptoContext::Params p;
   p.salt.assign(std::begin(m_header.salt), std::end(m_header.salt));
   p.nonce.assign(std::begin(m_header.nonce), std::end(m_header.nonce));
@@ -207,8 +270,12 @@ bool Container::openEncrypted(const std::wstring &path, const std::wstring &pass
 bool Container::createFromPlainVhd(const std::wstring &plainVhdPath, const std::wstring &encOutPath,
                                    const std::wstring &password, const std::wstring &keyFilePath,
                                    uint32_t iterations) {
+  std::lock_guard<std::recursive_mutex> lg(m_mutex);
   close();
   m_path = encOutPath;
+  m_previousSessionDirty = false;
+  m_recoveredPendingJournal = false;
+  DeleteFileW((encOutPath + L".journal").c_str());
 
   std::ifstream in(plainVhdPath.c_str(), std::ios::binary | std::ios::in);
   if (!in.is_open()) return false;
@@ -515,6 +582,7 @@ bool Container::createFromPlainVhd(const std::wstring &plainVhdPath, const std::
 }
 
 bool Container::readPlain(uint64_t offset, uint8_t *buffer, size_t length) {
+  std::lock_guard<std::recursive_mutex> lg(m_mutex);
   if (!m_ready || !buffer || length == 0) return false;
   if (m_debug) {
     std::wcerr << L"[evhd] readPlain offset=" << offset << L" len=" << length << L"\n";
@@ -561,6 +629,7 @@ bool Container::readPlain(uint64_t offset, uint8_t *buffer, size_t length) {
 }
 
 bool Container::writePlain(uint64_t offset, const uint8_t *buffer, size_t length) {
+  std::lock_guard<std::recursive_mutex> lg(m_mutex);
   if (!m_ready || !buffer || length == 0) return false;
   // 将逻辑写入拆分为物理段（重定位范围写入尾部）
   std::vector<RelocEntry> segs; mapLogicalToPhysical(offset, length, segs);
@@ -579,12 +648,39 @@ bool Container::writePlain(uint64_t offset, const uint8_t *buffer, size_t length
   }
   size_t bufPos = 0;
   std::vector<uint8_t> tmp; tmp.reserve(length);
+  std::vector<uint8_t> ciphertext;
+  ciphertext.reserve(length);
   for (const auto &s : merged) {
     tmp.assign(buffer + bufPos, buffer + bufPos + static_cast<size_t>(s.length));
     if (!m_crypto.encryptRange(s.physicalOffset, tmp.data(), static_cast<size_t>(s.length))) return false;
-    if (!writeRawPhys(s.physicalOffset, tmp.data(), static_cast<size_t>(s.length))) return false;
+    ciphertext.insert(ciphertext.end(), tmp.begin(), tmp.end());
     bufPos += static_cast<size_t>(s.length);
   }
+
+  if (!prepareJournalTransaction(merged, ciphertext)) {
+    m_ready = false;
+    return false;
+  }
+
+  size_t cipherPos = 0;
+  for (const auto &s : merged) {
+    if (!writeRawPhys(s.physicalOffset, ciphertext.data() + cipherPos, static_cast<size_t>(s.length))) {
+      m_ready = false;
+      return false;
+    }
+    cipherPos += static_cast<size_t>(s.length);
+  }
+
+  if (!flush()) {
+    m_ready = false;
+    return false;
+  }
+
+  if (!clearJournalState(true)) {
+    m_ready = false;
+    return false;
+  }
+
   return true;
 }
 
@@ -659,6 +755,7 @@ bool Container::readHeader() {
 }
 
 bool Container::writeHeader() {
+  std::lock_guard<std::recursive_mutex> lg(m_mutex);
   // 规范化写入：按 readHeader 使用的布局逐字段写入，避免结构体填充差异
   m_file.seekp(0, std::ios::beg);
   struct HeaderV1 {
@@ -686,10 +783,228 @@ bool Container::writeHeader() {
   return !!m_file;
 }
 
+bool Container::initializeJournal() {
+  memset(&m_journal, 0, sizeof(m_journal));
+  memcpy(m_journal.magic, JOURNAL_MAGIC, sizeof(m_journal.magic));
+  m_journal.version = JOURNAL_VERSION;
+  m_journal.state = JOURNAL_STATE_CLEAN;
+  m_journal.dirty = 0;
+  m_journal.entryCount = 0;
+  m_journal.dataSize = 0;
+  m_journal.sequence = 0;
+  m_journal.entriesCRC32 = 0;
+  m_journal.dataCRC32 = 0;
+  return writeJournalHeader(true, true);
+}
+
+bool Container::readJournalHeader() {
+  if (m_journalHandle == INVALID_HANDLE_VALUE) return false;
+  uint64_t size = getHandleSize(m_journalHandle);
+  if (size == 0) {
+    return initializeJournal();
+  }
+  if (size < sizeof(m_journal)) {
+    return false;
+  }
+  if (!readHandleExact(m_journalHandle, 0, &m_journal, sizeof(m_journal))) {
+    return false;
+  }
+  if (memcmp(m_journal.magic, JOURNAL_MAGIC, sizeof(m_journal.magic)) != 0) return false;
+  if (m_journal.version != JOURNAL_VERSION) return false;
+  return true;
+}
+
+bool Container::writeJournalHeader(bool flushToDisk, bool trimToHeader) {
+  if (m_journalHandle == INVALID_HANDLE_VALUE) return false;
+  if (!writeHandleExact(m_journalHandle, 0, &m_journal, sizeof(m_journal))) {
+    return false;
+  }
+  if (trimToHeader && !resizeHandle(m_journalHandle, sizeof(m_journal))) {
+    return false;
+  }
+  if (flushToDisk && !FlushFileBuffers(m_journalHandle)) {
+    return false;
+  }
+  return true;
+}
+
+bool Container::ensureJournalDirty() {
+  if (m_journalHandle == INVALID_HANDLE_VALUE) return false;
+  if (m_journal.dirty != 0) return true;
+  m_journal.state = JOURNAL_STATE_CLEAN;
+  m_journal.dirty = 1;
+  m_journal.entryCount = 0;
+  m_journal.dataSize = 0;
+  m_journal.entriesCRC32 = 0;
+  m_journal.dataCRC32 = 0;
+  return writeJournalHeader(true, true);
+}
+
+bool Container::clearJournalState(bool dirtyFlag) {
+  if (m_journalHandle == INVALID_HANDLE_VALUE) return false;
+  m_journal.state = JOURNAL_STATE_CLEAN;
+  m_journal.dirty = dirtyFlag ? 1u : 0u;
+  m_journal.entryCount = 0;
+  m_journal.dataSize = 0;
+  m_journal.entriesCRC32 = 0;
+  m_journal.dataCRC32 = 0;
+  return writeJournalHeader(true, true);
+}
+
+bool Container::prepareJournalTransaction(const std::vector<RelocEntry> &segments,
+                                         const std::vector<uint8_t> &ciphertext) {
+  if (m_journalHandle == INVALID_HANDLE_VALUE) return false;
+  if (!ensureJournalDirty()) return false;
+
+  std::vector<JournalEntryState> entries;
+  entries.reserve(segments.size());
+  uint64_t dataOffset = 0;
+  for (const auto &seg : segments) {
+    JournalEntryState entry{};
+    entry.physOffset = seg.physicalOffset;
+    entry.length = seg.length;
+    entry.dataOffset = dataOffset;
+    entries.push_back(entry);
+    dataOffset += seg.length;
+  }
+  if (dataOffset != ciphertext.size()) return false;
+
+  uint32_t entriesCRC = 0;
+  if (!entries.empty()) {
+    entriesCRC = crc32_update(0xFFFFFFFFU,
+                              reinterpret_cast<const uint8_t *>(entries.data()),
+                              entries.size() * sizeof(JournalEntryState)) ^ 0xFFFFFFFFU;
+  }
+  uint32_t dataCRC = 0;
+  if (!ciphertext.empty()) {
+    dataCRC = crc32_update(0xFFFFFFFFU, ciphertext.data(), ciphertext.size()) ^ 0xFFFFFFFFU;
+  }
+
+  m_journal.sequence += 1;
+  m_journal.state = JOURNAL_STATE_PREPARED;
+  m_journal.dirty = 1;
+  m_journal.entryCount = static_cast<uint32_t>(entries.size());
+  m_journal.dataSize = static_cast<uint64_t>(ciphertext.size());
+  m_journal.entriesCRC32 = entriesCRC;
+  m_journal.dataCRC32 = dataCRC;
+
+  const uint64_t entriesOffset = sizeof(m_journal);
+  const uint64_t dataOffsetBase = entriesOffset + static_cast<uint64_t>(entries.size()) * sizeof(JournalEntryState);
+  if (!writeHandleExact(m_journalHandle, 0, &m_journal, sizeof(m_journal))) return false;
+  if (!entries.empty() && !writeHandleExact(m_journalHandle, entriesOffset, entries.data(),
+                                            entries.size() * sizeof(JournalEntryState))) {
+    return false;
+  }
+  if (!ciphertext.empty() && !writeHandleExact(m_journalHandle, dataOffsetBase, ciphertext.data(), ciphertext.size())) {
+    return false;
+  }
+  if (!resizeHandle(m_journalHandle, dataOffsetBase + ciphertext.size())) return false;
+  return !!FlushFileBuffers(m_journalHandle);
+}
+
+bool Container::recoverPendingJournal() {
+  if (m_journalHandle == INVALID_HANDLE_VALUE) return false;
+  if (m_journal.state != JOURNAL_STATE_PREPARED || m_journal.entryCount == 0) {
+    return true;
+  }
+
+  const uint64_t entriesOffset = sizeof(m_journal);
+  const uint64_t dataOffsetBase = entriesOffset + static_cast<uint64_t>(m_journal.entryCount) * sizeof(JournalEntryState);
+  std::vector<JournalEntryState> entries(m_journal.entryCount);
+  if (!readHandleExact(m_journalHandle, entriesOffset, entries.data(), entries.size() * sizeof(JournalEntryState))) {
+    return false;
+  }
+  if (!entries.empty()) {
+    uint32_t entriesCRC = crc32_update(0xFFFFFFFFU,
+                                       reinterpret_cast<const uint8_t *>(entries.data()),
+                                       entries.size() * sizeof(JournalEntryState)) ^ 0xFFFFFFFFU;
+    if (entriesCRC != m_journal.entriesCRC32) return false;
+  }
+
+  std::vector<uint8_t> data(static_cast<size_t>(m_journal.dataSize));
+  if (!data.empty() && !readHandleExact(m_journalHandle, dataOffsetBase, data.data(), data.size())) {
+    return false;
+  }
+  if (!data.empty()) {
+    uint32_t dataCRC = crc32_update(0xFFFFFFFFU, data.data(), data.size()) ^ 0xFFFFFFFFU;
+    if (dataCRC != m_journal.dataCRC32) return false;
+  }
+
+  for (const auto &entry : entries) {
+    if (entry.dataOffset + entry.length > data.size()) return false;
+    if (!writeRawPhys(entry.physOffset, data.data() + entry.dataOffset, static_cast<size_t>(entry.length))) {
+      return false;
+    }
+  }
+  if (!flush()) return false;
+  return clearJournalState(false);
+}
+
+bool Container::openJournal() {
+  m_journalPath = m_path + L".journal";
+  m_journalHandle = CreateFileW(m_journalPath.c_str(), GENERIC_READ | GENERIC_WRITE,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                nullptr, OPEN_ALWAYS,
+                                FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED | FILE_FLAG_WRITE_THROUGH,
+                                nullptr);
+  if (m_journalHandle == INVALID_HANDLE_VALUE) {
+    return false;
+  }
+  if (!readJournalHeader()) {
+    closeJournal(false);
+    return false;
+  }
+
+  m_previousSessionDirty = (m_journal.dirty != 0);
+  m_recoveredPendingJournal = (m_journal.state == JOURNAL_STATE_PREPARED && m_journal.entryCount > 0);
+  if (m_recoveredPendingJournal && !recoverPendingJournal()) {
+    closeJournal(false);
+    return false;
+  }
+  if (m_journal.state == JOURNAL_STATE_CLEAN && m_journal.dirty != 0) {
+    if (!clearJournalState(false)) {
+      closeJournal(false);
+      return false;
+    }
+  }
+  return true;
+}
+
+void Container::closeJournal(bool cleanShutdown) {
+  if (m_journalHandle == INVALID_HANDLE_VALUE) return;
+  if (cleanShutdown && m_journal.state == JOURNAL_STATE_CLEAN) {
+    clearJournalState(false);
+  }
+  CloseHandle(m_journalHandle);
+  m_journalHandle = INVALID_HANDLE_VALUE;
+}
+
+bool Container::flush() {
+  std::lock_guard<std::recursive_mutex> lg(m_mutex);
+  bool ok = true;
+  if (m_file.is_open()) {
+    m_file.flush();
+    ok = ok && !!m_file;
+  }
+  if (m_handle != INVALID_HANDLE_VALUE) {
+    ok = ok && !!FlushFileBuffers(m_handle);
+  }
+  if (m_journalHandle != INVALID_HANDLE_VALUE) {
+    ok = ok && !!FlushFileBuffers(m_journalHandle);
+  }
+  return ok;
+}
+
 void Container::close() {
+  std::lock_guard<std::recursive_mutex> lg(m_mutex);
+  bool cleanShutdown = (m_journalHandle != INVALID_HANDLE_VALUE && m_journal.state == JOURNAL_STATE_CLEAN);
   m_ready = false;
+  if (m_handle != INVALID_HANDLE_VALUE) {
+    FlushFileBuffers(m_handle);
+  }
   if (m_file.is_open()) m_file.close();
   if (m_handle != INVALID_HANDLE_VALUE) { CloseHandle(m_handle); m_handle = INVALID_HANDLE_VALUE; }
+  closeJournal(cleanShutdown);
 }
 
 // 将逻辑范围拆分为一个或多个物理段，以便读取/写入时正确应用CTR偏移
@@ -830,7 +1145,7 @@ bool Container::readRawPhys(uint64_t physOffset, uint8_t *dst, size_t len) {
                    << L" alignedNeed=" << need << L" fileSize=" << fileSize << L"\n";
       }
       // buffered fallback using std::fstream (thread-safe via mutex)
-      std::lock_guard<std::mutex> lg(m_mutex);
+      std::lock_guard<std::recursive_mutex> lg(m_mutex);
       m_file.clear();
       m_file.seekg(static_cast<std::streamoff>(abs), std::ios::beg);
       m_file.read(reinterpret_cast<char*>(dst), static_cast<std::streamsize>(len));

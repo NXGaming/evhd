@@ -22,3 +22,5 @@ test.vhd
 .vscode/tasks.json
 tmp*
 test.evhd
+build/selftest_tmp/*
+selftest_tmp

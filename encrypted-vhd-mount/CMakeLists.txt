@@ -50,3 +50,15 @@ add_executable(evhd-bench
     "${SOURCE_ROOT}/evhd.h"
 )
 target_link_libraries(evhd-bench bcrypt)
+
+add_executable(evhd-selftest
+  "${SOURCE_ROOT}/selftest.cc"
+  "${SOURCE_ROOT}/crypto.cc"
+  "${SOURCE_ROOT}/evhd.cc"
+  "${SOURCE_ROOT}/crypto.h"
+  "${SOURCE_ROOT}/evhd.h"
+)
+target_link_libraries(evhd-selftest bcrypt)
+
+enable_testing()
+add_test(NAME evhd-selftest COMMAND evhd-selftest)

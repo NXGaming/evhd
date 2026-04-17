@@ -62,6 +62,7 @@ encrypted-vhd-mount.exe /k c:\path\to\keyfile.bin c:\path\to\encrypted.evhd M:\
 - 推荐使用 `--password-stdin` 从 stdin 读取 UTF-8 密码；`/p <password>` 仍可用于兼容场景。
 - `M:\` 可以是盘符或NTFS文件夹路径。
 - 若容器头部包含原始文件名元数据，则挂载盘内文件名会显示为该原始名；否则默认展示为 `decrypted.vhd`。
+- 当前版本默认启用崩溃恢复 Journal：每次写请求都会先把将要写入的密文记录到同目录 sidecar journal，再落盘到主容器；若机台直接断电，下次打开时会自动回放未完成事务并提示上次是异常关闭。
 
 ### 密钥派生（KDF）
 
