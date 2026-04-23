@@ -11,8 +11,19 @@ test.key
 errorlog.txt
 
 # Benchmark test files
+bench_*.evhd
+bench_*.vhd
 encrypted-vhd-mount/bench_*.evhd
 encrypted-vhd-mount/bench_*.vhd
+
+# Journal files
+*.journal
+
+# Build directories
+build_ninja/
+
+# Third-party dependencies (local modifications should not be committed)
+third_party/
 
 installer/EncryptedVHDMount-Setup.exe
 a.txt
