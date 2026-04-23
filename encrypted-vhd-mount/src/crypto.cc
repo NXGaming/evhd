@@ -29,6 +29,9 @@ CryptoContext::~CryptoContext() {
     BCryptCloseAlgorithmProvider(m_aesAlg, 0);
     m_aesAlg = nullptr;
   }
+  if (!m_key.empty()) {
+    SecureZeroMemory(m_key.data(), m_key.size());
+  }
 }
 
 bool CryptoContext::init(const std::wstring &password, const Params &params) {
@@ -134,56 +137,56 @@ bool CryptoContext::deriveKey(const std::wstring &password, const Params &params
 
   keyOut.resize(32);
 
+  // 声明所有敏感局部变量在函数顶部，以便统一清理
+  std::string pwUtf8;
+  std::vector<uint8_t> pbkdfKey;
   std::vector<uint8_t> finalKey(32);
+  std::vector<uint8_t> digest;
+  bool ok = false;
 
   // Enforce header-selected KDF strictly. Do not fall back silently.
   if (params.kdfMethod == 0 /*KDF_PASSWORD*/) {
     // Require non-empty password
     if (password.empty()) {
       std::cerr << "KDF_PASSWORD requires a non-empty password" << std::endl;
-      BCryptCloseAlgorithmProvider(hPbkdf, 0);
-      return false;
+      goto cleanup;
     }
-    std::string pwUtf8 = WideToUtf8(password);
+    pwUtf8 = WideToUtf8(password);
     status = BCryptDeriveKeyPBKDF2(hPbkdf,
                                    (PUCHAR)pwUtf8.data(), (ULONG)pwUtf8.size(),
                                    (PUCHAR)params.salt.data(), (ULONG)params.salt.size(),
                                    (ULONGLONG)params.iterations,
                                    (PUCHAR)finalKey.data(), (ULONG)finalKey.size(), 0);
-    if (status != 0) { std::cerr << "BCryptDeriveKeyPBKDF2(pw) failed: 0x" << std::hex << status << std::dec << std::endl; BCryptCloseAlgorithmProvider(hPbkdf, 0); return false; }
+    if (status != 0) { std::cerr << "BCryptDeriveKeyPBKDF2(pw) failed: 0x" << std::hex << status << std::dec << std::endl; goto cleanup; }
   } else if (params.kdfMethod == 1 /*KDF_KEYFILE*/) {
     // Require key file path
     if (params.keyFilePath.empty()) {
       std::cerr << "KDF_KEYFILE requires a key file path" << std::endl;
-      BCryptCloseAlgorithmProvider(hPbkdf, 0);
-      return false;
+      goto cleanup;
     }
-    std::vector<uint8_t> digest;
-    if (!sha256File(params.keyFilePath, digest)) { BCryptCloseAlgorithmProvider(hPbkdf, 0); return false; }
+    if (!sha256File(params.keyFilePath, digest)) { goto cleanup; }
     status = BCryptDeriveKeyPBKDF2(hPbkdf,
                                    (PUCHAR)digest.data(), (ULONG)digest.size(),
                                    (PUCHAR)params.salt.data(), (ULONG)params.salt.size(),
                                    (ULONGLONG)params.iterations,
                                    (PUCHAR)finalKey.data(), (ULONG)finalKey.size(), 0);
-    if (status != 0) { std::cerr << "BCryptDeriveKeyPBKDF2(keyfile) failed: 0x" << std::hex << status << std::dec << std::endl; BCryptCloseAlgorithmProvider(hPbkdf, 0); return false; }
+    if (status != 0) { std::cerr << "BCryptDeriveKeyPBKDF2(keyfile) failed: 0x" << std::hex << status << std::dec << std::endl; goto cleanup; }
   } else if (params.kdfMethod == 2 /*KDF_PASSWORD_PLUS_KEYFILE*/) {
     // Require both password and key file
     if (password.empty() || params.keyFilePath.empty()) {
       std::cerr << "KDF_PASSWORD_PLUS_KEYFILE requires both password and key file" << std::endl;
-      BCryptCloseAlgorithmProvider(hPbkdf, 0);
-      return false;
+      goto cleanup;
     }
-    std::string pwUtf8 = WideToUtf8(password);
-    std::vector<uint8_t> pbkdfKey(32);
+    pwUtf8 = WideToUtf8(password);
+    pbkdfKey.resize(32);
     status = BCryptDeriveKeyPBKDF2(hPbkdf,
                                    (PUCHAR)pwUtf8.data(), (ULONG)pwUtf8.size(),
                                    (PUCHAR)params.salt.data(), (ULONG)params.salt.size(),
                                    (ULONGLONG)params.iterations,
                                    (PUCHAR)pbkdfKey.data(), (ULONG)pbkdfKey.size(), 0);
-    if (status != 0) { std::cerr << "BCryptDeriveKeyPBKDF2(pw) failed: 0x" << std::hex << status << std::dec << std::endl; BCryptCloseAlgorithmProvider(hPbkdf, 0); return false; }
+    if (status != 0) { std::cerr << "BCryptDeriveKeyPBKDF2(pw) failed: 0x" << std::hex << status << std::dec << std::endl; goto cleanup; }
 
-    std::vector<uint8_t> digest;
-    if (!sha256File(params.keyFilePath, digest)) { BCryptCloseAlgorithmProvider(hPbkdf, 0); return false; }
+    if (!sha256File(params.keyFilePath, digest)) { goto cleanup; }
 
     // data = pbkdfKey || salt || nonce
     std::vector<uint8_t> data;
@@ -192,16 +195,22 @@ bool CryptoContext::deriveKey(const std::wstring &password, const Params &params
     data.insert(data.end(), params.salt.begin(), params.salt.end());
     data.insert(data.end(), params.nonce.begin(), params.nonce.end());
 
-    if (!hmacSha256(digest, data, finalKey)) { BCryptCloseAlgorithmProvider(hPbkdf, 0); return false; }
+    if (!hmacSha256(digest, data, finalKey)) { goto cleanup; }
   } else {
     std::cerr << "Unsupported KDF method: " << params.kdfMethod << std::endl;
-    BCryptCloseAlgorithmProvider(hPbkdf, 0);
-    return false;
+    goto cleanup;
   }
 
-  BCryptCloseAlgorithmProvider(hPbkdf, 0);
   keyOut = finalKey;
-  return true;
+  ok = true;
+
+cleanup:
+  if (!pwUtf8.empty()) SecureZeroMemory(pwUtf8.data(), pwUtf8.size());
+  if (!pbkdfKey.empty()) SecureZeroMemory(pbkdfKey.data(), pbkdfKey.size());
+  if (!finalKey.empty()) SecureZeroMemory(finalKey.data(), finalKey.size());
+  if (!digest.empty()) SecureZeroMemory(digest.data(), digest.size());
+  if (hPbkdf) BCryptCloseAlgorithmProvider(hPbkdf, 0);
+  return ok;
 }
 
 void CryptoContext::makeIV(uint64_t fileOffset, std::vector<uint8_t> &ivOut) const {

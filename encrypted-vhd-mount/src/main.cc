@@ -235,7 +235,10 @@ int wmain(int argc, wchar_t **argv) {
   std::wcout.flush();
   
   Parameters params;
-  if (!readParameters(params, argc, argv)) return 0;
+  if (!readParameters(params, argc, argv)) {
+    if (!params.password.empty()) SecureZeroMemory(params.password.data(), params.password.size() * sizeof(wchar_t));
+    return 0;
+  }
 
   std::wcout << L"[main] args parsed. debug=" << (params.debugMode ? L"on" : L"off")
              << L" initVhdPath=" << (params.initVhdPath.empty() ? L"(none)" : params.initVhdPath)
@@ -246,10 +249,12 @@ int wmain(int argc, wchar_t **argv) {
   if (!params.initVhdPath.empty()) {
     evhd::Container c;
     if (!c.createFromPlainVhd(params.initVhdPath, params.encFilePath, params.password, params.keyFilePath)) {
-      std::wcout << L"Encryption init failed\n"; 
+      std::wcout << L"Encryption init failed\n";
+      if (!params.password.empty()) SecureZeroMemory(params.password.data(), params.password.size() * sizeof(wchar_t));
       return 1;
     }
     std::wcout << L"Generated encrypted file: " << params.encFilePath << L"\n";
+    if (!params.password.empty()) SecureZeroMemory(params.password.data(), params.password.size() * sizeof(wchar_t));
     return 0;
   }
 
@@ -265,6 +270,8 @@ int wmain(int argc, wchar_t **argv) {
   std::wcout << L"[main] opening encrypted: " << cfg.encryptedFilePath << L"\n";
   if (!mountCtx.setup(cfg)) {
     std::wcout << L"[main] Failed to open encrypted file or wrong password\n";
+    if (!params.password.empty()) SecureZeroMemory(params.password.data(), params.password.size() * sizeof(wchar_t));
+    if (!cfg.password.empty()) SecureZeroMemory(cfg.password.data(), cfg.password.size() * sizeof(wchar_t));
     return 1;
   }
 
@@ -273,6 +280,8 @@ int wmain(int argc, wchar_t **argv) {
   
   // Ensure Dokan2 DLL is loaded before entering DokanMain
   if (!ensureDokanLoaded()) {
+    if (!params.password.empty()) SecureZeroMemory(params.password.data(), params.password.size() * sizeof(wchar_t));
+    if (!cfg.password.empty()) SecureZeroMemory(cfg.password.data(), cfg.password.size() * sizeof(wchar_t));
     return 1;
   }
   DokanInit();
@@ -323,6 +332,8 @@ int wmain(int argc, wchar_t **argv) {
   if (watcher.joinable()) {
     watcher.detach();
   }
-  
+
+  if (!params.password.empty()) SecureZeroMemory(params.password.data(), params.password.size() * sizeof(wchar_t));
+  if (!cfg.password.empty()) SecureZeroMemory(cfg.password.data(), cfg.password.size() * sizeof(wchar_t));
   return 0;
 }
