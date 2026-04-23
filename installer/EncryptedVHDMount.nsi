@@ -14,7 +14,7 @@ InstallDir "$PROGRAMFILES64\EncryptedVHDMount"
 RequestExecutionLevel admin
 
 ; Reference app binary relative to script folder (installer\ ..\encrypted-vhd-mount\...)
-!define APP_BIN "..\\build\\encrypted-vhd-mount.exe"
+!define APP_BIN "..\\build\\Release\\encrypted-vhd-mount.exe"
 
 ; MUI 页面
 !insertmacro MUI_PAGE_WELCOME
