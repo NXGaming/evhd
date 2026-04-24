@@ -14,10 +14,17 @@
 namespace evhd {
 
 static void randomBytes(uint8_t *buf, size_t n) {
+  if (n == 0) return;
+  BCRYPT_ALG_HANDLE hRand = nullptr;
+  NTSTATUS status = BCryptOpenAlgorithmProvider(&hRand, BCRYPT_RNG_ALGORITHM, nullptr, 0);
+  if (status == 0) {
+    status = BCryptGenRandom(hRand, buf, static_cast<ULONG>(n), 0);
+    BCryptCloseAlgorithmProvider(hRand, 0);
+    if (status == 0) return;
+  }
+  // Fallback: std::random_device (usually CSPRNG on Windows)
   std::random_device rd;
-  std::mt19937 gen(rd());
-  std::uniform_int_distribution<uint32_t> dist(0, 255);
-  for (size_t i = 0; i < n; ++i) buf[i] = static_cast<uint8_t>(dist(gen));
+  for (size_t i = 0; i < n; ++i) buf[i] = static_cast<uint8_t>(rd() & 0xFF);
 }
 
 static std::wstring hexBytes(const uint8_t *data, size_t n) {
@@ -83,30 +90,60 @@ constexpr uint32_t JOURNAL_STATE_CLEAN = 0;
 constexpr uint32_t JOURNAL_STATE_PREPARED = 1;
 
 static bool readHandleExact(HANDLE handle, uint64_t offset, void *buffer, size_t len) {
-  LARGE_INTEGER pos{};
-  pos.QuadPart = static_cast<LONGLONG>(offset);
-  if (!SetFilePointerEx(handle, pos, nullptr, FILE_BEGIN)) return false;
   size_t doneTotal = 0;
   while (doneTotal < len) {
-    DWORD done = 0;
     DWORD want = static_cast<DWORD>(std::min<size_t>(len - doneTotal, 1u << 20));
-    if (!ReadFile(handle, static_cast<uint8_t *>(buffer) + doneTotal, want, &done, nullptr)) return false;
-    if (done != want) return false;
+    OVERLAPPED ov{};
+    ov.Offset     = static_cast<DWORD>((offset + doneTotal) & 0xFFFFFFFFULL);
+    ov.OffsetHigh = static_cast<DWORD>((offset + doneTotal) >> 32);
+    HANDLE hEvt = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!hEvt) return false;
+    ov.hEvent = hEvt;
+    DWORD done = 0;
+    BOOL ok = ReadFile(handle, static_cast<uint8_t *>(buffer) + doneTotal, want, nullptr, &ov);
+    if (!ok) {
+      DWORD err = GetLastError();
+      if (err == ERROR_IO_PENDING) {
+        ok = GetOverlappedResult(handle, &ov, &done, TRUE);
+      } else {
+        CloseHandle(hEvt);
+        return false;
+      }
+    } else {
+      done = want;
+    }
+    CloseHandle(hEvt);
+    if (!ok || done != want) return false;
     doneTotal += done;
   }
   return true;
 }
 
 static bool writeHandleExact(HANDLE handle, uint64_t offset, const void *buffer, size_t len) {
-  LARGE_INTEGER pos{};
-  pos.QuadPart = static_cast<LONGLONG>(offset);
-  if (!SetFilePointerEx(handle, pos, nullptr, FILE_BEGIN)) return false;
   size_t doneTotal = 0;
   while (doneTotal < len) {
-    DWORD done = 0;
     DWORD want = static_cast<DWORD>(std::min<size_t>(len - doneTotal, 1u << 20));
-    if (!WriteFile(handle, static_cast<const uint8_t *>(buffer) + doneTotal, want, &done, nullptr)) return false;
-    if (done != want) return false;
+    OVERLAPPED ov{};
+    ov.Offset     = static_cast<DWORD>((offset + doneTotal) & 0xFFFFFFFFULL);
+    ov.OffsetHigh = static_cast<DWORD>((offset + doneTotal) >> 32);
+    HANDLE hEvt = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!hEvt) return false;
+    ov.hEvent = hEvt;
+    DWORD done = 0;
+    BOOL ok = WriteFile(handle, static_cast<const uint8_t *>(buffer) + doneTotal, want, nullptr, &ov);
+    if (!ok) {
+      DWORD err = GetLastError();
+      if (err == ERROR_IO_PENDING) {
+        ok = GetOverlappedResult(handle, &ov, &done, TRUE);
+      } else {
+        CloseHandle(hEvt);
+        return false;
+      }
+    } else {
+      done = want;
+    }
+    CloseHandle(hEvt);
+    if (!ok || done != want) return false;
     doneTotal += done;
   }
   return true;
@@ -236,26 +273,43 @@ bool Container::openEncrypted(const std::wstring &path, const std::wstring &pass
     std::wcerr << L"[evhd] journal: recovered pending write transaction" << std::endl;
   }
 
-  CryptoContext::Params p;
-  p.salt.assign(std::begin(m_header.salt), std::end(m_header.salt));
-  p.nonce.assign(std::begin(m_header.nonce), std::end(m_header.nonce));
-  p.iterations = m_header.kdfIterations;
-  p.kdfMethod = m_header.kdfMethod;
-  p.keyFilePath = keyFilePath;
-  if (!m_crypto.init(password, p)) { std::wcerr << L"[evhd] crypto init failed" << std::endl; return false; }
+  if (!initCryptoContext(password, keyFilePath)) {
+    std::wcerr << L"[evhd] crypto init failed" << std::endl;
+    return false;
+  }
 
-  // Print KDF diagnostics: salt, nonce, and key prefix fingerprint
-  if (m_debug) {
-    auto keyPrefix = m_crypto.keyPrefix8();
-    std::wcerr << L"[evhd] kdf salt=" << hexBytes(m_header.salt, sizeof(m_header.salt))
-               << L" nonce=" << hexBytes(m_header.nonce, sizeof(m_header.nonce))
-               << L" key[0..7]=" << hexBytes(keyPrefix.data(), keyPrefix.size()) << L"\n";
+  // v5: 验证 headerHMAC（必须在 crypto init 之后，因为需要 hmacKey）
+  if (m_header.version >= 5) {
+    std::vector<uint8_t> computedHeaderHmac(32);
+    if (!computeHeaderHmac(computedHeaderHmac)) {
+      std::wcerr << L"[evhd] compute header HMAC failed" << std::endl;
+      return false;
+    }
+    uint8_t diff = 0;
+    for (size_t i = 0; i < 32; ++i) diff |= (computedHeaderHmac[i] ^ m_headerHmac[i]);
+    if (diff != 0) {
+      std::wcerr << L"[evhd] header HMAC verification FAILED" << std::endl;
+      return false;
+    }
+    if (m_debug) std::wcerr << L"[evhd] header HMAC verification OK" << std::endl;
+
+    // v5: 读取 payload auth tags
+    if (m_header.authBlockSize > 0) {
+      if (!readPayloadAuthTags()) {
+        std::wcerr << L"[evhd] read payload auth tags failed" << std::endl;
+        return false;
+      }
+      if (m_debug) {
+        std::wcerr << L"[evhd] payload auth tags loaded. count="
+                   << (m_payloadAuthTags.size() / 32) << L"\n";
+      }
+    }
   }
 
   // Integrity check: validate pseudo-random pad fingerprint over cut ranges
   bool integrityOk = verifyIntegrity();
   if (!integrityOk) {
-    std::wcerr << L"[evhd] integrity check FAILED: pseudo pad CRC mismatch or read error" << std::endl;
+    std::wcerr << L"[evhd] integrity check FAILED: pseudo pad mismatch or read error" << std::endl;
     // 严格模式：校验失败则拒绝打开
     m_ready = false;
     return false;
@@ -269,7 +323,7 @@ bool Container::openEncrypted(const std::wstring &path, const std::wstring &pass
 
 bool Container::createFromPlainVhd(const std::wstring &plainVhdPath, const std::wstring &encOutPath,
                                    const std::wstring &password, const std::wstring &keyFilePath,
-                                   uint32_t iterations) {
+                                   uint32_t iterations, uint32_t targetVersion) {
   std::lock_guard<std::recursive_mutex> lg(m_mutex);
   close();
   m_path = encOutPath;
@@ -284,15 +338,16 @@ bool Container::createFromPlainVhd(const std::wstring &plainVhdPath, const std::
   uint64_t size = static_cast<uint64_t>(in.tellg());
   in.seekg(0, std::ios::beg);
 
-  m_file.open(encOutPath.c_str(), std::ios::binary | std::ios::out | std::ios::trunc);
+  m_file.open(encOutPath.c_str(), std::ios::binary | std::ios::in | std::ios::out | std::ios::trunc);
   if (!m_file.is_open()) return false;
 
   // Prepare header
   memset(&m_header, 0, sizeof(m_header));
   memcpy(m_header.magic, MAGIC, sizeof(m_header.magic));
-  m_header.version = 4; // v4: add relocation metadata for partition table obfuscation
+  m_header.version = targetVersion; // v4 or v5
   m_header.kdfIterations = iterations;
   m_header.originalSize = size;
+  m_header.authBlockSize = 0; // disable payload auth tags by default (performance vs security tradeoff)
   randomBytes(m_header.salt, sizeof(m_header.salt));
   randomBytes(m_header.nonce, sizeof(m_header.nonce));
   // decide kdf method
@@ -476,15 +531,42 @@ bool Container::createFromPlainVhd(const std::wstring &plainVhdPath, const std::
     }
     if (!m_file) { std::wcerr << L"Write relocation metadata failed" << std::endl; return false; }
     m_payloadOffset += sizeof(uint32_t) + static_cast<uint64_t>(count) * (sizeof(uint64_t) * 3);
-    // v4 扩展：写入填充指纹盐与占位CRC32，稍后回填CRC结果
+    // v4/v5 扩展：写入填充指纹盐与占位指纹，稍后回填结果
     randomBytes(m_padSalt, sizeof(m_padSalt));
-    uint32_t zeroCRC = 0;
-    m_file.write(reinterpret_cast<const char*>(m_padSalt), sizeof(m_padSalt));
-    m_file.write(reinterpret_cast<const char*>(&zeroCRC), sizeof(zeroCRC));
+    if (m_header.version >= 5) {
+      m_padHmac.assign(32, 0);
+      m_file.write(reinterpret_cast<const char*>(m_padSalt), sizeof(m_padSalt));
+      m_file.write(reinterpret_cast<const char*>(m_padHmac.data()), m_padHmac.size());
+      m_payloadOffset += sizeof(m_padSalt) + m_padHmac.size();
+    } else {
+      uint32_t zeroCRC = 0;
+      m_file.write(reinterpret_cast<const char*>(m_padSalt), sizeof(m_padSalt));
+      m_file.write(reinterpret_cast<const char*>(&zeroCRC), sizeof(zeroCRC));
+      m_payloadOffset += sizeof(m_padSalt) + sizeof(uint32_t);
+    }
     if (!m_file) { std::wcerr << L"Write pad fingerprint failed" << std::endl; return false; }
-    m_payloadOffset += sizeof(m_padSalt) + sizeof(uint32_t);
     // 诊断：打印写入后的条目数量与负载起始偏移
     std::wcerr << L"[evhd] create: relocCount=" << count
+               << L" payloadOffset=" << m_payloadOffset << L"\n";
+  }
+  // v5 扩展：写入 authBlockSize + headerHMAC 占位 + relocAuthHMACs 占位
+  if (m_header.version >= 5) {
+    m_file.write(reinterpret_cast<const char*>(&m_header.authBlockSize), sizeof(m_header.authBlockSize));
+    if (!m_file) { std::wcerr << L"Write v5 authBlockSize failed" << std::endl; return false; }
+    // headerHMAC placeholder (32 bytes, backfilled later)
+    m_headerHmac.assign(32, 0);
+    m_file.write(reinterpret_cast<const char*>(m_headerHmac.data()), m_headerHmac.size());
+    if (!m_file) { std::wcerr << L"Write v5 headerHMAC placeholder failed" << std::endl; return false; }
+    // reloc auth HMAC placeholders
+    uint32_t relocAuthCount = static_cast<uint32_t>(m_relocations.size());
+    m_file.write(reinterpret_cast<const char*>(&relocAuthCount), sizeof(relocAuthCount));
+    m_relocAuthHmacs.resize(relocAuthCount, std::vector<uint8_t>(32, 0));
+    for (const auto &hmac : m_relocAuthHmacs) {
+      m_file.write(reinterpret_cast<const char*>(hmac.data()), 32);
+    }
+    if (!m_file) { std::wcerr << L"Write v5 reloc auth HMACs failed" << std::endl; return false; }
+    m_payloadOffset += sizeof(m_header.authBlockSize) + 32 + sizeof(uint32_t) + relocAuthCount * 32;
+    std::wcerr << L"[evhd] create: v5 ext written. authBlockSize=" << m_header.authBlockSize
                << L" payloadOffset=" << m_payloadOffset << L"\n";
   }
   // Ensure write pointer is at payload start
@@ -496,26 +578,21 @@ bool Container::createFromPlainVhd(const std::wstring &plainVhdPath, const std::
   CryptoContext::Params p;
   p.salt.assign(std::begin(m_header.salt), std::end(m_header.salt));
   p.nonce.assign(std::begin(m_header.nonce), std::end(m_header.nonce));
-  p.iterations = m_header.kdfIterations;
-  p.kdfMethod = m_header.kdfMethod;
-  p.keyFilePath = keyFilePath;
-  if (!m_crypto.init(password, p)) { std::wcerr << L"Init crypto context failed" << std::endl; return false; }
-
-  // 打印 KDF 诊断：salt、nonce 和派生密钥前缀指纹
-  {
-    auto keyPrefix = m_crypto.keyPrefix8();
-    std::wcerr << L"[evhd] kdf salt=" << hexBytes(m_header.salt, sizeof(m_header.salt))
-               << L" nonce=" << hexBytes(m_header.nonce, sizeof(m_header.nonce))
-               << L" key[0..7]=" << hexBytes(keyPrefix.data(), keyPrefix.size()) << L"\n";
+  if (!initCryptoContext(password, keyFilePath)) {
+    std::wcerr << L"Init crypto context failed" << std::endl;
+    return false;
   }
 
   // Stream encrypt
   const size_t bufSize = 1024 * 1024; // 1MB buffer
   std::vector<uint8_t> buf(bufSize);
   uint64_t offset = 0;
-  // 初始化伪随机填充生成的种子与CRC
+  // 初始化伪随机填充生成的种子
   uint64_t padSeed = deriveSeedFromSalt(m_padSalt);
+  // v4: CRC32 初始值
   uint32_t padCRC = 0xFFFFFFFFU;
+  // v5: 收集所有填充数据用于 HMAC
+  std::vector<uint8_t> padHmacInput;
   while (offset < size) {
     size_t chunk = static_cast<size_t>(std::min<uint64_t>(bufSize, size - offset));
     in.read(reinterpret_cast<char*>(buf.data()), chunk);
@@ -532,9 +609,18 @@ bool Container::createFromPlainVhd(const std::wstring &plainVhdPath, const std::
         uint64_t t = std::min<uint64_t>(cHi, hi);
         size_t relStart = static_cast<size_t>(s - cLo);
         size_t relLen   = static_cast<size_t>(t - s);
-        // 生成伪随机填充并更新指纹 CRC
+        // 生成伪随机填充
         fillPseudoRandom(buf.data() + relStart, relLen, padSeed, s);
-        padCRC = crc32_update(padCRC, buf.data() + relStart, relLen);
+        // v5: 收集填充数据
+        if (m_header.version >= 5) {
+          size_t oldSize = padHmacInput.size();
+          padHmacInput.resize(oldSize + relLen);
+          memcpy(padHmacInput.data() + oldSize, buf.data() + relStart, relLen);
+        }
+        // v4: 更新 CRC（v5 不再使用）
+        if (m_header.version < 5) {
+          padCRC = crc32_update(padCRC, buf.data() + relStart, relLen);
+        }
       }
     }
     if (!m_crypto.encryptRange(offset, buf.data(), chunk)) { std::wcerr << L"Encrypt block failed" << std::endl; return false; }
@@ -542,11 +628,23 @@ bool Container::createFromPlainVhd(const std::wstring &plainVhdPath, const std::
     if (!m_file) { std::wcerr << L"Write ciphertext payload failed" << std::endl; return false; }
     offset += chunk;
   }
-  
-  // 最终 CRC 取反得到结果，回填到头部扩展
-  m_padCRC32 = padCRC ^ 0xFFFFFFFFU;
+
+  // v5: 计算 padHmac
+  if (m_header.version >= 5 && !padHmacInput.empty()) {
+    m_padHmac.resize(32);
+    if (!m_crypto.hmacData(padHmacInput.data(), padHmacInput.size(), m_padHmac)) {
+      std::wcerr << L"Compute pad HMAC failed" << std::endl; return false;
+    }
+  }
+
+  // v4: 最终 CRC 取反得到结果，回填到头部扩展
+  if (m_header.version < 5) {
+    m_padCRC32 = padCRC ^ 0xFFFFFFFFU;
+  }
+
+  // 回填填充指纹到头部
   if (m_header.version >= 4) {
-    // 计算 CRC 字段的绝对文件偏移（严格对齐 readHeader 布局）：
+    // 计算指纹字段的绝对文件偏移（严格对齐 readHeader 布局）：
     struct HeaderV1 { char magic[8]; uint32_t version; uint32_t kdfIterations; uint64_t originalSize; uint8_t salt[16]; uint8_t nonce[16]; };
     uint64_t base = sizeof(HeaderV1);
     if (m_header.version >= 3) {
@@ -558,10 +656,20 @@ bool Container::createFromPlainVhd(const std::wstring &plainVhdPath, const std::
     }
     uint32_t count = static_cast<uint32_t>(m_relocations.size());
     base += sizeof(uint32_t) + static_cast<uint64_t>(count) * (sizeof(uint64_t) * 3);
-    uint64_t padCRCPos = base + sizeof(m_padSalt); // 在盐之后的CRC位置
-    m_file.seekp(padCRCPos, std::ios::beg);
-    m_file.write(reinterpret_cast<const char*>(&m_padCRC32), sizeof(m_padCRC32));
-    if (!m_file) { std::wcerr << L"Backfill pad CRC32 failed" << std::endl; return false; }
+
+    if (m_header.version >= 5) {
+      // v5: 回填 padHmac
+      uint64_t padHmacPos = base + sizeof(m_padSalt);
+      m_file.seekp(padHmacPos, std::ios::beg);
+      m_file.write(reinterpret_cast<const char*>(m_padHmac.data()), m_padHmac.size());
+      if (!m_file) { std::wcerr << L"Backfill pad HMAC failed" << std::endl; return false; }
+    } else {
+      // v4: 回填 CRC32
+      uint64_t padCRCPos = base + sizeof(m_padSalt);
+      m_file.seekp(padCRCPos, std::ios::beg);
+      m_file.write(reinterpret_cast<const char*>(&m_padCRC32), sizeof(m_padCRC32));
+      if (!m_file) { std::wcerr << L"Backfill pad CRC32 failed" << std::endl; return false; }
+    }
   }
 
   // 追加尾部：写入被剪切出来的原始数据（使用其物理偏移作为CTR偏移）
@@ -569,13 +677,98 @@ bool Container::createFromPlainVhd(const std::wstring &plainVhdPath, const std::
     const auto &e = m_relocations[i];
     std::vector<uint8_t> tmp = relocData[i];
     if (!m_crypto.encryptRange(e.physicalOffset, tmp.data(), tmp.size())) { std::wcerr << L"Encrypt relocated segment failed" << std::endl; return false; }
+    // v5: 计算重定位数据 HMAC
+    if (m_header.version >= 5) {
+      if (!computeRelocHmac(e.physicalOffset, tmp.data(), tmp.size(), m_relocAuthHmacs[i])) {
+        std::wcerr << L"Compute reloc HMAC failed" << std::endl; return false;
+      }
+    }
     m_file.seekp(m_payloadOffset + e.physicalOffset, std::ios::beg);
     m_file.write(reinterpret_cast<const char*>(tmp.data()), tmp.size());
     if (!m_file) { std::wcerr << L"Write relocated segment failed" << std::endl; return false; }
   }
 
+  // v5: 写入 payload auth tags 到文件尾部
+  if (m_header.version >= 5 && m_header.authBlockSize > 0) {
+    // Flush writes before reading back via separate ifstream
+    m_file.flush();
+    uint64_t numBlocks = (m_header.originalSize + m_header.authBlockSize - 1) / m_header.authBlockSize;
+    std::vector<uint8_t> tags;
+    tags.resize(static_cast<size_t>(numBlocks * 32));
+    std::ifstream readBack(m_path.c_str(), std::ios::binary | std::ios::in);
+    if (!readBack.is_open()) {
+      std::wcerr << L"Open read-back stream for auth tags failed" << std::endl; return false;
+    }
+    for (uint64_t b = 0; b < numBlocks; ++b) {
+      uint64_t physOff = b * m_header.authBlockSize;
+      uint64_t blockLen = std::min<uint64_t>(m_header.authBlockSize, m_header.originalSize - physOff);
+      // 回读刚写入的密文
+      std::vector<uint8_t> cipher(static_cast<size_t>(blockLen));
+      readBack.seekg(static_cast<std::streamoff>(m_payloadOffset + physOff), std::ios::beg);
+      readBack.read(reinterpret_cast<char*>(cipher.data()), static_cast<std::streamsize>(blockLen));
+      if (!readBack) { std::wcerr << L"Read back ciphertext for auth tag failed" << std::endl; return false; }
+      std::vector<uint8_t> tag(32);
+      if (!computePayloadAuthTag(physOff, cipher.data(), cipher.size(), tag)) {
+        std::wcerr << L"Compute payload auth tag failed" << std::endl; return false;
+      }
+      memcpy(tags.data() + b * 32, tag.data(), 32);
+    }
+    readBack.close();
+    m_file.seekp(0, std::ios::end);
+    m_file.write(reinterpret_cast<const char*>(tags.data()), tags.size());
+    if (!m_file) { std::wcerr << L"Write payload auth tags failed" << std::endl; return false; }
+  }
+
   m_file.flush();
   in.close();
+
+  // v5: 使用独立的 fstream 回填 HMAC 字段（避免大量写入后 seekp 的问题）
+  if (m_header.version >= 5) {
+    m_file.close();
+    std::fstream backfill(m_path.c_str(), std::ios::binary | std::ios::in | std::ios::out);
+    if (!backfill.is_open()) {
+      std::wcerr << L"Open backfill stream failed" << std::endl; return false;
+    }
+
+    // 回填 padHmac
+    struct HeaderV1 { char magic[8]; uint32_t version; uint32_t kdfIterations; uint64_t originalSize; uint8_t salt[16]; uint8_t nonce[16]; };
+    uint64_t base = sizeof(HeaderV1);
+    if (m_header.version >= 3) base += sizeof(uint32_t);
+    if (m_header.version >= 2) {
+      uint32_t nameLen = static_cast<uint32_t>(m_originalName.size());
+      base += sizeof(uint32_t) + static_cast<uint64_t>(nameLen) * sizeof(wchar_t);
+    }
+    uint32_t count = static_cast<uint32_t>(m_relocations.size());
+    base += sizeof(uint32_t) + static_cast<uint64_t>(count) * (sizeof(uint64_t) * 3);
+
+    uint64_t padHmacPos = base + sizeof(m_padSalt);
+    backfill.seekp(static_cast<std::streamoff>(padHmacPos), std::ios::beg);
+    backfill.write(reinterpret_cast<const char*>(m_padHmac.data()), m_padHmac.size());
+    if (!backfill) { std::wcerr << L"Backfill pad HMAC failed" << std::endl; return false; }
+
+    // 回填 headerHMAC
+    if (!computeHeaderHmac(m_headerHmac)) {
+      std::wcerr << L"Compute header HMAC failed" << std::endl; return false;
+    }
+    uint64_t hmacPos = padHmacPos + m_padHmac.size() + sizeof(m_header.authBlockSize);
+    backfill.seekp(static_cast<std::streamoff>(hmacPos), std::ios::beg);
+    backfill.write(reinterpret_cast<const char*>(m_headerHmac.data()), m_headerHmac.size());
+    if (!backfill) { std::wcerr << L"Backfill header HMAC failed" << std::endl; return false; }
+
+    // 回填 reloc auth HMACs
+    uint64_t relocHmacPos = hmacPos + 32 + sizeof(uint32_t);
+    backfill.seekp(static_cast<std::streamoff>(relocHmacPos), std::ios::beg);
+    for (const auto &hmac : m_relocAuthHmacs) {
+      backfill.write(reinterpret_cast<const char*>(hmac.data()), 32);
+    }
+    if (!backfill) { std::wcerr << L"Backfill reloc auth HMACs failed" << std::endl; return false; }
+
+    backfill.flush();
+    backfill.close();
+
+    // 重新打开 m_file 以保持 Container 状态一致
+    m_file.open(m_path.c_str(), std::ios::binary | std::ios::in | std::ios::out);
+  }
 
   m_ready = true;
   return true;
@@ -616,6 +809,32 @@ bool Container::readPlain(uint64_t offset, uint8_t *buffer, size_t length) {
         std::wcerr << L"[evhd] readRawPhys fail at phys=" << s.physicalOffset << L" len=" << s.length << L"\n";
       }
       return false;
+    }
+    // v5: verify payload auth tags for each auth block before decrypting
+    if (m_crypto.isV5() && m_header.authBlockSize > 0) {
+      uint64_t segPos = 0;
+      while (segPos < s.length) {
+        uint64_t blockStart = ((s.physicalOffset + segPos) / m_header.authBlockSize) * m_header.authBlockSize;
+        uint64_t blockEnd = blockStart + m_header.authBlockSize;
+        uint64_t inBlockOffset = (s.physicalOffset + segPos) - blockStart;
+        uint64_t take = std::min<uint64_t>(blockEnd - (s.physicalOffset + segPos), s.length - segPos);
+        // We need the full auth block ciphertext to verify HMAC
+        // Read the full block from file (we already have partial in buffer)
+        std::vector<uint8_t> blockCipher(static_cast<size_t>(m_header.authBlockSize));
+        if (!readRawPhys(blockStart, blockCipher.data(), static_cast<size_t>(m_header.authBlockSize))) {
+          if (m_debug) {
+            std::wcerr << L"[evhd] auth tag verification read fail at blockStart=" << blockStart << L"\n";
+          }
+          return false;
+        }
+        if (!verifyPayloadAuthTag(blockStart, blockCipher.data(), static_cast<size_t>(m_header.authBlockSize))) {
+          if (m_debug) {
+            std::wcerr << L"[evhd] payload auth tag verification FAILED at blockStart=" << blockStart << L"\n";
+          }
+          return false;
+        }
+        segPos += take;
+      }
     }
     if (!m_crypto.decryptRange(s.physicalOffset, buffer + bufPos, static_cast<size_t>(s.length))) {
       if (m_debug) {
@@ -698,7 +917,7 @@ bool Container::readHeader() {
   m_file.read(reinterpret_cast<char*>(&v1), sizeof(v1));
   if (!m_file) return false;
   if (memcmp(v1.magic, MAGIC, sizeof(v1.magic)) != 0) return false;
-  if (v1.version != 1 && v1.version != 2 && v1.version != 3 && v1.version != 4) return false;
+  if (v1.version != 1 && v1.version != 2 && v1.version != 3 && v1.version != 4 && v1.version != 5) return false;
   // fill common fields
   memcpy(m_header.magic, v1.magic, sizeof(m_header.magic));
   m_header.version = v1.version;
@@ -747,9 +966,41 @@ bool Container::readHeader() {
     m_payloadOffset += sizeof(uint32_t) + static_cast<uint64_t>(count) * (sizeof(uint64_t) * 3);
     // 额外读取填充指纹：16字节盐 + 4字节CRC32
     m_file.read(reinterpret_cast<char*>(m_padSalt), sizeof(m_padSalt));
-    m_file.read(reinterpret_cast<char*>(&m_padCRC32), sizeof(m_padCRC32));
+    if (m_header.version >= 5) {
+      m_padHmac.resize(32);
+      m_file.read(reinterpret_cast<char*>(m_padHmac.data()), 32);
+      if (!m_file) return false;
+      m_payloadOffset += sizeof(m_padSalt) + 32;
+    } else {
+      m_file.read(reinterpret_cast<char*>(&m_padCRC32), sizeof(m_padCRC32));
+      if (!m_file) return false;
+      m_payloadOffset += sizeof(m_padSalt) + sizeof(uint32_t);
+    }
+  }
+  // v5: 读取扩展字段
+  if (m_header.version >= 5) {
+    m_file.read(reinterpret_cast<char*>(&m_header.authBlockSize), sizeof(m_header.authBlockSize));
     if (!m_file) return false;
-    m_payloadOffset += sizeof(m_padSalt) + sizeof(uint32_t);
+    m_payloadOffset += sizeof(m_header.authBlockSize);
+
+    // 读取 headerHMAC（稍后验证，在 crypto init 之后）
+    m_headerHmac.resize(32);
+    m_file.read(reinterpret_cast<char*>(m_headerHmac.data()), 32);
+    if (!m_file) return false;
+    m_payloadOffset += 32;
+
+    // 读取重定位数据 auth HMACs
+    uint32_t relocAuthCount = 0;
+    m_file.read(reinterpret_cast<char*>(&relocAuthCount), sizeof(relocAuthCount));
+    if (!m_file) return false;
+    m_payloadOffset += sizeof(uint32_t);
+    m_relocAuthHmacs.resize(relocAuthCount);
+    for (uint32_t i = 0; i < relocAuthCount; ++i) {
+      m_relocAuthHmacs[i].resize(32);
+      m_file.read(reinterpret_cast<char*>(m_relocAuthHmacs[i].data()), 32);
+      if (!m_file) return false;
+      m_payloadOffset += 32;
+    }
   }
   return true;
 }
@@ -869,15 +1120,30 @@ bool Container::prepareJournalTransaction(const std::vector<RelocEntry> &segment
   }
   if (dataOffset != ciphertext.size()) return false;
 
-  uint32_t entriesCRC = 0;
-  if (!entries.empty()) {
-    entriesCRC = crc32_update(0xFFFFFFFFU,
-                              reinterpret_cast<const uint8_t *>(entries.data()),
-                              entries.size() * sizeof(JournalEntryState)) ^ 0xFFFFFFFFU;
-  }
-  uint32_t dataCRC = 0;
-  if (!ciphertext.empty()) {
-    dataCRC = crc32_update(0xFFFFFFFFU, ciphertext.data(), ciphertext.size()) ^ 0xFFFFFFFFU;
+  // v5: compute HMACs; v4: compute CRC32
+  std::vector<uint8_t> entriesHmac(32), dataHmac(32);
+  uint32_t entriesCRC = 0, dataCRC = 0;
+  if (m_crypto.isV5()) {
+    if (!entries.empty()) {
+      if (!m_crypto.hmacData(reinterpret_cast<const uint8_t *>(entries.data()),
+                             entries.size() * sizeof(JournalEntryState), entriesHmac)) {
+        return false;
+      }
+    }
+    if (!ciphertext.empty()) {
+      if (!m_crypto.hmacData(ciphertext.data(), ciphertext.size(), dataHmac)) {
+        return false;
+      }
+    }
+  } else {
+    if (!entries.empty()) {
+      entriesCRC = crc32_update(0xFFFFFFFFU,
+                                reinterpret_cast<const uint8_t *>(entries.data()),
+                                entries.size() * sizeof(JournalEntryState)) ^ 0xFFFFFFFFU;
+    }
+    if (!ciphertext.empty()) {
+      dataCRC = crc32_update(0xFFFFFFFFU, ciphertext.data(), ciphertext.size()) ^ 0xFFFFFFFFU;
+    }
   }
 
   m_journal.sequence += 1;
@@ -890,6 +1156,7 @@ bool Container::prepareJournalTransaction(const std::vector<RelocEntry> &segment
 
   const uint64_t entriesOffset = sizeof(m_journal);
   const uint64_t dataOffsetBase = entriesOffset + static_cast<uint64_t>(entries.size()) * sizeof(JournalEntryState);
+  const uint64_t totalDataSize = dataOffsetBase + ciphertext.size();
   if (!writeHandleExact(m_journalHandle, 0, &m_journal, sizeof(m_journal))) return false;
   if (!entries.empty() && !writeHandleExact(m_journalHandle, entriesOffset, entries.data(),
                                             entries.size() * sizeof(JournalEntryState))) {
@@ -898,7 +1165,14 @@ bool Container::prepareJournalTransaction(const std::vector<RelocEntry> &segment
   if (!ciphertext.empty() && !writeHandleExact(m_journalHandle, dataOffsetBase, ciphertext.data(), ciphertext.size())) {
     return false;
   }
-  if (!resizeHandle(m_journalHandle, dataOffsetBase + ciphertext.size())) return false;
+  // v5: append HMACs at the end of journal file
+  if (m_crypto.isV5()) {
+    if (!writeHandleExact(m_journalHandle, totalDataSize, entriesHmac.data(), entriesHmac.size())) return false;
+    if (!writeHandleExact(m_journalHandle, totalDataSize + entriesHmac.size(), dataHmac.data(), dataHmac.size())) return false;
+    if (!resizeHandle(m_journalHandle, totalDataSize + entriesHmac.size() + dataHmac.size())) return false;
+  } else {
+    if (!resizeHandle(m_journalHandle, totalDataSize)) return false;
+  }
   return !!FlushFileBuffers(m_journalHandle);
 }
 
@@ -914,20 +1188,49 @@ bool Container::recoverPendingJournal() {
   if (!readHandleExact(m_journalHandle, entriesOffset, entries.data(), entries.size() * sizeof(JournalEntryState))) {
     return false;
   }
-  if (!entries.empty()) {
-    uint32_t entriesCRC = crc32_update(0xFFFFFFFFU,
-                                       reinterpret_cast<const uint8_t *>(entries.data()),
-                                       entries.size() * sizeof(JournalEntryState)) ^ 0xFFFFFFFFU;
-    if (entriesCRC != m_journal.entriesCRC32) return false;
-  }
 
   std::vector<uint8_t> data(static_cast<size_t>(m_journal.dataSize));
   if (!data.empty() && !readHandleExact(m_journalHandle, dataOffsetBase, data.data(), data.size())) {
     return false;
   }
-  if (!data.empty()) {
-    uint32_t dataCRC = crc32_update(0xFFFFFFFFU, data.data(), data.size()) ^ 0xFFFFFFFFU;
-    if (dataCRC != m_journal.dataCRC32) return false;
+
+  // v5: verify HMACs appended at end of journal file
+  if (m_crypto.isV5()) {
+    uint64_t totalDataSize = dataOffsetBase + m_journal.dataSize;
+    std::vector<uint8_t> storedEntriesHmac(32), storedDataHmac(32);
+    if (!readHandleExact(m_journalHandle, totalDataSize, storedEntriesHmac.data(), 32)) return false;
+    if (!readHandleExact(m_journalHandle, totalDataSize + 32, storedDataHmac.data(), 32)) return false;
+
+    if (!entries.empty()) {
+      std::vector<uint8_t> computedEntriesHmac(32);
+      if (!m_crypto.hmacData(reinterpret_cast<const uint8_t *>(entries.data()),
+                             entries.size() * sizeof(JournalEntryState), computedEntriesHmac)) {
+        return false;
+      }
+      if (!m_crypto.verifyHmac(reinterpret_cast<const uint8_t *>(entries.data()),
+                               entries.size() * sizeof(JournalEntryState), storedEntriesHmac.data())) {
+        std::wcerr << L"[evhd] journal entries HMAC verification FAILED" << std::endl;
+        return false;
+      }
+    }
+    if (!data.empty()) {
+      if (!m_crypto.verifyHmac(data.data(), data.size(), storedDataHmac.data())) {
+        std::wcerr << L"[evhd] journal data HMAC verification FAILED" << std::endl;
+        return false;
+      }
+    }
+  } else {
+    // v4: verify CRC32
+    if (!entries.empty()) {
+      uint32_t entriesCRC = crc32_update(0xFFFFFFFFU,
+                                         reinterpret_cast<const uint8_t *>(entries.data()),
+                                         entries.size() * sizeof(JournalEntryState)) ^ 0xFFFFFFFFU;
+      if (entriesCRC != m_journal.entriesCRC32) return false;
+    }
+    if (!data.empty()) {
+      uint32_t dataCRC = crc32_update(0xFFFFFFFFU, data.data(), data.size()) ^ 0xFFFFFFFFU;
+      if (dataCRC != m_journal.dataCRC32) return false;
+    }
   }
 
   for (const auto &entry : entries) {
@@ -945,7 +1248,7 @@ bool Container::openJournal() {
   m_journalHandle = CreateFileW(m_journalPath.c_str(), GENERIC_READ | GENERIC_WRITE,
                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                 nullptr, OPEN_ALWAYS,
-                                FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED | FILE_FLAG_WRITE_THROUGH,
+                                FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED | FILE_FLAG_WRITE_THROUGH | FILE_FLAG_OVERLAPPED,
                                 nullptr);
   if (m_journalHandle == INVALID_HANDLE_VALUE) {
     return false;
@@ -1005,6 +1308,12 @@ void Container::close() {
   if (m_file.is_open()) m_file.close();
   if (m_handle != INVALID_HANDLE_VALUE) { CloseHandle(m_handle); m_handle = INVALID_HANDLE_VALUE; }
   closeJournal(cleanShutdown);
+  // Clear v5 sensitive state
+  m_padHmac.clear();
+  m_headerHmac.clear();
+  m_relocAuthHmacs.clear();
+  m_payloadAuthTags.clear();
+  m_payloadAuthTagsOffset = 0;
 }
 
 // 将逻辑范围拆分为一个或多个物理段，以便读取/写入时正确应用CTR偏移
@@ -1059,6 +1368,8 @@ bool Container::verifyIntegrity() {
     return a.logicalOffset < b.logicalOffset;
   });
 
+  // v5: collect all pad data for HMAC; v4: use CRC32
+  std::vector<uint8_t> padHmacInput;
   uint32_t crc = 0xFFFFFFFFU;
   const size_t bufSize = 1 << 20; // 1MB
   std::vector<uint8_t> buf; buf.reserve(bufSize);
@@ -1084,19 +1395,44 @@ bool Container::verifyIntegrity() {
         }
         return false;
       }
-      // 累积CRC（创建时对伪随机填充的CRC应与此解密结果一致）
-      crc = crc32_update(crc, buf.data(), take);
+      if (m_header.version >= 5) {
+        size_t oldSize = padHmacInput.size();
+        padHmacInput.resize(oldSize + take);
+        memcpy(padHmacInput.data() + oldSize, buf.data(), take);
+      } else {
+        crc = crc32_update(crc, buf.data(), take);
+      }
       processed += take;
     }
   }
 
-  uint32_t computed = crc ^ 0xFFFFFFFFU;
-  if (computed != m_padCRC32) {
-    if (m_debug) {
-      std::wcerr << L"[evhd] integrity: padCRC32 mismatch. expected=0x" << std::hex << m_padCRC32
-                 << L" computed=0x" << computed << std::dec << L"\n";
+  if (m_header.version >= 5) {
+    std::vector<uint8_t> computedHmac(32);
+    if (!padHmacInput.empty()) {
+      if (!m_crypto.hmacData(padHmacInput.data(), padHmacInput.size(), computedHmac)) {
+        if (m_debug) std::wcerr << L"[evhd] integrity: HMAC computation failed\n";
+        return false;
+      }
     }
-    return false;
+    uint8_t diff = 0;
+    for (size_t i = 0; i < 32; ++i) {
+      diff |= (computedHmac[i] ^ m_padHmac[i]);
+    }
+    if (diff != 0) {
+      if (m_debug) {
+        std::wcerr << L"[evhd] integrity: padHMAC mismatch\n";
+      }
+      return false;
+    }
+  } else {
+    uint32_t computed = crc ^ 0xFFFFFFFFU;
+    if (computed != m_padCRC32) {
+      if (m_debug) {
+        std::wcerr << L"[evhd] integrity: padCRC32 mismatch. expected=0x" << std::hex << m_padCRC32
+                   << L" computed=0x" << computed << std::dec << L"\n";
+      }
+      return false;
+    }
   }
   return true;
 }
@@ -1274,6 +1610,154 @@ bool Container::writeRawPhys(uint64_t physOffset, const uint8_t *src, size_t len
     _aligned_free(buf);
     return okW && doneW == wantW;
   }
+}
+
+// ---------------------------------------------------------------------------
+// v5: Crypto context initialization with version-aware key derivation
+// ---------------------------------------------------------------------------
+bool Container::initCryptoContext(const std::wstring &password,
+                                  const std::wstring &keyFilePath) {
+  CryptoContext::Params p;
+  p.salt.assign(std::begin(m_header.salt), std::end(m_header.salt));
+  p.nonce.assign(std::begin(m_header.nonce), std::end(m_header.nonce));
+  p.iterations = m_header.kdfIterations;
+  p.kdfMethod = m_header.kdfMethod;
+  p.keyFilePath = keyFilePath;
+  if (m_header.version >= 5) {
+    return m_crypto.initV5(password, p);
+  }
+  return m_crypto.init(password, p);
+}
+
+// ---------------------------------------------------------------------------
+// v5: HMAC helpers
+// ---------------------------------------------------------------------------
+bool Container::computeHeaderHmac(std::vector<uint8_t> &hmacOut) const {
+  hmacOut.assign(32, 0);
+  if (!m_crypto.isV5()) return false;
+  // HMAC covers: Header v1 + v3 ext + v2 ext + v4 ext + authBlockSize
+  // Build a contiguous buffer of all header fields before the HMAC field itself
+  std::vector<uint8_t> input;
+  struct HeaderV1 {
+    char magic[8];
+    uint32_t version;
+    uint32_t kdfIterations;
+    uint64_t originalSize;
+    uint8_t  salt[16];
+    uint8_t  nonce[16];
+  } v1{};
+  memcpy(v1.magic, m_header.magic, sizeof(v1.magic));
+  v1.version = m_header.version;
+  v1.kdfIterations = m_header.kdfIterations;
+  v1.originalSize = m_header.originalSize;
+  memcpy(v1.salt, m_header.salt, sizeof(v1.salt));
+  memcpy(v1.nonce, m_header.nonce, sizeof(v1.nonce));
+  input.resize(sizeof(v1));
+  memcpy(input.data(), &v1, sizeof(v1));
+  if (m_header.version >= 3) {
+    size_t oldSize = input.size();
+    input.resize(oldSize + sizeof(uint32_t));
+    memcpy(input.data() + oldSize, &m_header.kdfMethod, sizeof(uint32_t));
+  }
+  if (m_header.version >= 2) {
+    uint32_t nameLen = static_cast<uint32_t>(m_originalName.size());
+    size_t oldSize = input.size();
+    input.resize(oldSize + sizeof(uint32_t) + nameLen * sizeof(wchar_t));
+    memcpy(input.data() + oldSize, &nameLen, sizeof(uint32_t));
+    if (nameLen > 0) {
+      memcpy(input.data() + oldSize + sizeof(uint32_t), m_originalName.c_str(), nameLen * sizeof(wchar_t));
+    }
+  }
+  if (m_header.version >= 4) {
+    uint32_t count = static_cast<uint32_t>(m_relocations.size());
+    size_t oldSize = input.size();
+    input.resize(oldSize + sizeof(uint32_t) + count * sizeof(RelocEntry));
+    memcpy(input.data() + oldSize, &count, sizeof(uint32_t));
+    if (count > 0) {
+      memcpy(input.data() + oldSize + sizeof(uint32_t), m_relocations.data(), count * sizeof(RelocEntry));
+    }
+    oldSize = input.size();
+    if (m_header.version >= 5) {
+      input.resize(oldSize + sizeof(m_padSalt) + m_padHmac.size());
+      memcpy(input.data() + oldSize, m_padSalt, sizeof(m_padSalt));
+      memcpy(input.data() + oldSize + sizeof(m_padSalt), m_padHmac.data(), m_padHmac.size());
+    } else {
+      input.resize(oldSize + sizeof(m_padSalt) + sizeof(uint32_t));
+      memcpy(input.data() + oldSize, m_padSalt, sizeof(m_padSalt));
+      memcpy(input.data() + oldSize + sizeof(m_padSalt), &m_padCRC32, sizeof(uint32_t));
+    }
+  }
+  if (m_header.version >= 5) {
+    size_t oldSize = input.size();
+    input.resize(oldSize + sizeof(m_header.authBlockSize));
+    memcpy(input.data() + oldSize, &m_header.authBlockSize, sizeof(m_header.authBlockSize));
+  }
+  return m_crypto.hmacData(input.data(), input.size(), hmacOut);
+}
+
+bool Container::computeRelocHmac(uint64_t physOffset, const uint8_t *cipherData,
+                                 size_t len, std::vector<uint8_t> &hmacOut) const {
+  hmacOut.assign(32, 0);
+  if (!m_crypto.isV5() || !cipherData || len == 0) return false;
+  std::vector<uint8_t> input(sizeof(physOffset) + len);
+  memcpy(input.data(), &physOffset, sizeof(physOffset));
+  memcpy(input.data() + sizeof(physOffset), cipherData, len);
+  return m_crypto.hmacData(input.data(), input.size(), hmacOut);
+}
+
+bool Container::computePayloadAuthTag(uint64_t physBlockOffset, const uint8_t *cipherData,
+                                      size_t len, std::vector<uint8_t> &tagOut) const {
+  tagOut.assign(32, 0);
+  if (!m_crypto.isV5() || !cipherData || len == 0) return false;
+  std::vector<uint8_t> input(sizeof(physBlockOffset) + len);
+  memcpy(input.data(), &physBlockOffset, sizeof(physBlockOffset));
+  memcpy(input.data() + sizeof(physBlockOffset), cipherData, len);
+  return m_crypto.hmacData(input.data(), input.size(), tagOut);
+}
+
+bool Container::verifyPayloadAuthTag(uint64_t physBlockOffset, const uint8_t *cipherData,
+                                     size_t len) const {
+  if (!m_crypto.isV5() || m_header.authBlockSize == 0) return true;
+  if (!cipherData || len == 0) return false;
+  uint64_t blockIndex = physBlockOffset / m_header.authBlockSize;
+  if (m_payloadAuthTags.empty()) return false;
+  size_t tagOffset = static_cast<size_t>(blockIndex * 32);
+  if (tagOffset + 32 > m_payloadAuthTags.size()) return false;
+  std::vector<uint8_t> computed(32);
+  if (!computePayloadAuthTag(physBlockOffset, cipherData, len, computed)) return false;
+  // Constant-time compare
+  uint8_t diff = 0;
+  for (size_t i = 0; i < 32; ++i) {
+    diff |= (computed[i] ^ m_payloadAuthTags[tagOffset + i]);
+  }
+  return diff == 0;
+}
+
+uint64_t Container::payloadAuthTagsOffset() const {
+  if (!m_crypto.isV5() || m_header.authBlockSize == 0 || m_relocations.empty()) {
+    return m_payloadOffset + m_header.originalSize;
+  }
+  // Find max physical offset among relocations
+  uint64_t maxPhys = m_header.originalSize;
+  for (const auto &e : m_relocations) {
+    uint64_t end = e.physicalOffset + e.length;
+    if (end > maxPhys) maxPhys = end;
+  }
+  return m_payloadOffset + maxPhys;
+}
+
+bool Container::readPayloadAuthTags() {
+  if (!m_crypto.isV5() || m_header.authBlockSize == 0) return true;
+  uint64_t numBlocks = (m_header.originalSize + m_header.authBlockSize - 1) / m_header.authBlockSize;
+  size_t tagsSize = static_cast<size_t>(numBlocks * 32);
+  m_payloadAuthTags.resize(tagsSize);
+  uint64_t tagsOffset = payloadAuthTagsOffset();
+  if (!readHandleExact(m_handle, tagsOffset, m_payloadAuthTags.data(), tagsSize)) {
+    m_payloadAuthTags.clear();
+    return false;
+  }
+  m_payloadAuthTagsOffset = tagsOffset;
+  return true;
 }
 
 } // namespace evhd

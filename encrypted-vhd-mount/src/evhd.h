@@ -32,6 +32,8 @@ struct Header {
   uint8_t  salt[16];       // PBKDF2 salt
   uint8_t  nonce[16];      // CTR IV base
   uint32_t kdfMethod;      // since version 3
+  // v5 extensions (stored on disk)
+  uint32_t authBlockSize{4096};  // 0 = disable payload auth
 };
 
 // 逻辑->物理重定位条目：将明文视图中的某段（逻辑偏移）剪切到尾部（物理偏移）
@@ -50,7 +52,7 @@ public:
                      const std::wstring &keyFilePath);
   bool createFromPlainVhd(const std::wstring &plainVhdPath, const std::wstring &encOutPath,
                           const std::wstring &password, const std::wstring &keyFilePath,
-                          uint32_t iterations = 200000);
+                          uint32_t iterations = 200000, uint32_t targetVersion = 5);
 
   bool readPlain(uint64_t offset, uint8_t *buffer, size_t length);
   bool writePlain(uint64_t offset, const uint8_t *buffer, size_t length);
@@ -88,6 +90,18 @@ private:
   bool prepareJournalTransaction(const std::vector<RelocEntry> &segments,
                                  const std::vector<uint8_t> &ciphertext);
   void closeJournal(bool cleanShutdown);
+
+  // v5: HMAC helpers
+  bool computeHeaderHmac(std::vector<uint8_t> &hmacOut) const;
+  bool computeRelocHmac(uint64_t physOffset, const uint8_t *cipherData, size_t len,
+                        std::vector<uint8_t> &hmacOut) const;
+  bool computePayloadAuthTag(uint64_t physBlockOffset, const uint8_t *cipherData,
+                             size_t len, std::vector<uint8_t> &tagOut) const;
+  bool verifyPayloadAuthTag(uint64_t physBlockOffset, const uint8_t *cipherData,
+                            size_t len) const;
+  bool readPayloadAuthTags();
+  uint64_t payloadAuthTagsOffset() const;
+  bool initCryptoContext(const std::wstring &password, const std::wstring &keyFilePath);
 
 private:
   struct JournalHeaderState {
@@ -127,6 +141,12 @@ private:
   // v4 扩展：剪切填充指纹与盐（用于生成伪随机填充）
   uint8_t m_padSalt[16]{};
   uint32_t m_padCRC32{0};
+  // v5 扩展：HMAC 替代 CRC32
+  std::vector<uint8_t> m_padHmac; // 32 bytes, v5 only
+  std::vector<uint8_t> m_headerHmac; // 32 bytes, v5 only
+  std::vector<std::vector<uint8_t>> m_relocAuthHmacs; // 32 bytes per entry, v5 only
+  std::vector<uint8_t> m_payloadAuthTags; // 32 bytes per authBlock, v5 only
+  uint64_t m_payloadAuthTagsOffset{0}; // absolute file offset of auth tags
   bool m_unbuffered{false};
   uint32_t m_sectorSize{4096};
   // 原生偏移式I/O（Overlapped）辅助

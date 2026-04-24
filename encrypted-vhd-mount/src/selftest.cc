@@ -410,6 +410,301 @@ bool testPendingJournalRecovery(const std::filesystem::path &dir) {
   return true;
 }
 
+// v4 backward compatibility: create v4 container, verify open/read/write works
+bool testV4BackwardCompat(const std::filesystem::path &dir) {
+  auto plainPath = dir / L"v4-compat.vhd";
+  auto encPath = dir / L"v4-compat.evhd";
+  if (!writeFile(plainPath, makeMbrPlain())) return false;
+
+  Container c;
+  if (!c.createFromPlainVhd(plainPath.wstring(), encPath.wstring(), kPassword, L"", 200000, 4)) {
+    std::wcerr << L"[selftest] v4-compat: create failed" << std::endl;
+    return false;
+  }
+  c.close();
+
+  Container reopen;
+  if (!reopen.openEncrypted(encPath.wstring(), kPassword, L"")) {
+    std::wcerr << L"[selftest] v4-compat: reopen failed" << std::endl;
+    return false;
+  }
+  std::vector<uint8_t> readBuf(512);
+  if (!reopen.readPlain(0, readBuf.data(), readBuf.size())) {
+    std::wcerr << L"[selftest] v4-compat: read failed" << std::endl;
+    return false;
+  }
+  // verify MBR signature
+  if (readBuf[510] != 0x55 || readBuf[511] != 0xAA) {
+    std::wcerr << L"[selftest] v4-compat: MBR signature mismatch" << std::endl;
+    return false;
+  }
+  reopen.close();
+  return true;
+}
+
+// v5 header HMAC tamper detection: flip a byte in header, verify open fails
+bool testV5HeaderHmacTamper(const std::filesystem::path &dir) {
+  auto plainPath = dir / L"v5-header-tamper.vhd";
+  auto encPath = dir / L"v5-header-tamper.evhd";
+  if (!writeFile(plainPath, makeMbrPlain())) return false;
+
+  Container c;
+  if (!c.createFromPlainVhd(plainPath.wstring(), encPath.wstring(), kPassword, L"")) {
+    std::wcerr << L"[selftest] v5-header-tamper: create failed" << std::endl;
+    return false;
+  }
+  c.close();
+
+  // Flip a byte in the version field (offset 8)
+  {
+    std::fstream fs(encPath, std::ios::binary | std::ios::in | std::ios::out);
+    if (!fs) return false;
+    fs.seekp(8, std::ios::beg);
+    uint8_t byte = 0xFF;
+    fs.write(reinterpret_cast<const char*>(&byte), 1);
+  }
+
+  Container reopen;
+  if (reopen.openEncrypted(encPath.wstring(), kPassword, L"")) {
+    std::wcerr << L"[selftest] v5-header-tamper: expected open to fail after tampering" << std::endl;
+    reopen.close();
+    return false;
+  }
+  return true;
+}
+
+// v5 pad HMAC tamper detection: flip a byte in pad HMAC, verify open fails
+bool testV5PadHmacTamper(const std::filesystem::path &dir) {
+  auto plainPath = dir / L"v5-pad-tamper.vhd";
+  auto encPath = dir / L"v5-pad-tamper.evhd";
+  if (!writeFile(plainPath, makeMbrPlain())) return false;
+
+  Container c;
+  if (!c.createFromPlainVhd(plainPath.wstring(), encPath.wstring(), kPassword, L"")) {
+    std::wcerr << L"[selftest] v5-pad-tamper: create failed" << std::endl;
+    return false;
+  }
+  uint64_t payloadOffset = c.payloadOffset();
+  c.close();
+
+  // In v5: padHmac is 32 bytes immediately before authBlockSize
+  // payloadOffset = padHmacPos + 32(padHmac) + 4(authBlockSize) + 32(headerHmac) + 4(relocAuthCount) + 32(relocAuthHmacs)
+  // = padHmacPos + 104
+  uint64_t padHmacPos = payloadOffset - 104;
+
+  // Flip a byte in padHMAC field
+  {
+    std::fstream fs(encPath, std::ios::binary | std::ios::in | std::ios::out);
+    if (!fs) return false;
+    fs.seekp(static_cast<std::streamoff>(padHmacPos), std::ios::beg);
+    uint8_t byte = 0xFF;
+    fs.write(reinterpret_cast<const char*>(&byte), 1);
+    fs.flush();
+  }
+
+  Container reopen;
+  if (reopen.openEncrypted(encPath.wstring(), kPassword, L"")) {
+    std::wcerr << L"[selftest] v5-pad-tamper: expected open to fail after tampering" << std::endl;
+    reopen.close();
+    return false;
+  }
+  return true;
+}
+
+// v5 journal HMAC tamper detection: tamper journal data HMAC, verify recovery fails
+bool testV5JournalHmacTamper(const std::filesystem::path &dir) {
+  auto plainPath = dir / L"v5-journal-tamper.vhd";
+  auto encPath = dir / L"v5-journal-tamper.evhd";
+  if (!writeFile(plainPath, makeMbrPlain())) return false;
+
+  Container created;
+  if (!created.createFromPlainVhd(plainPath.wstring(), encPath.wstring(), kPassword, L"")) {
+    std::wcerr << L"[selftest] v5-journal-tamper: create failed" << std::endl;
+    return false;
+  }
+  created.close();
+
+  // Create a journal with tampered data HMAC
+  auto jpath = journalPathFor(encPath);
+  std::vector<uint8_t> journalContent;
+  {
+    JournalHeaderState header{};
+    memcpy(header.magic, kJournalMagic, sizeof(header.magic));
+    header.version = kJournalVersion;
+    header.state = kJournalStatePrepared;
+    header.dirty = 1;
+    header.entryCount = 1;
+    header.dataSize = 64;
+    header.sequence = 1;
+
+    JournalEntryState entry{};
+    entry.physOffset = 4096;
+    entry.length = 64;
+    entry.dataOffset = 0;
+
+    std::vector<uint8_t> data(64, 0xAB);
+
+    // Serialize to buffer
+    journalContent.resize(sizeof(header) + sizeof(entry) + data.size() + 64); // +64 for HMAC placeholders
+    memcpy(journalContent.data(), &header, sizeof(header));
+    memcpy(journalContent.data() + sizeof(header), &entry, sizeof(entry));
+    memcpy(journalContent.data() + sizeof(header) + sizeof(entry), data.data(), data.size());
+    // HMAC placeholders: fill with non-zero to simulate tampered HMACs
+    memset(journalContent.data() + sizeof(header) + sizeof(entry) + data.size(), 0xCD, 64);
+  }
+  if (!writeFile(jpath, journalContent)) return false;
+
+  // Attempt to open: should detect tampered journal HMAC and fail recovery
+  Container reopen;
+  if (reopen.openEncrypted(encPath.wstring(), kPassword, L"")) {
+    std::wcerr << L"[selftest] v5-journal-tamper: expected open to fail after journal tampering" << std::endl;
+    reopen.close();
+    return false;
+  }
+  return true;
+}
+
+// v5 concurrent writes: multi-thread writes followed by reopen
+bool testV5ConcurrentWrites(const std::filesystem::path &dir) {
+  auto plainPath = dir / L"v5-concurrent.vhd";
+  auto encPath = dir / L"v5-concurrent.evhd";
+  if (!writeFile(plainPath, makeMbrPlain())) return false;
+
+  Container created;
+  if (!created.createFromPlainVhd(plainPath.wstring(), encPath.wstring(), kPassword, L"")) {
+    std::wcerr << L"[selftest] v5-concurrent: create failed" << std::endl;
+    return false;
+  }
+  created.close();
+
+  Container c;
+  if (!c.openEncrypted(encPath.wstring(), kPassword, L"")) {
+    std::wcerr << L"[selftest] v5-concurrent: open failed" << std::endl;
+    return false;
+  }
+
+  std::vector<std::thread> workers;
+  for (int t = 0; t < 8; ++t) {
+    workers.emplace_back([&c, t]() {
+      std::vector<uint8_t> data(512, static_cast<uint8_t>(t + 1));
+      for (int i = 0; i < 32; ++i) {
+        uint64_t off = 4096 + static_cast<uint64_t>(t) * 512 + static_cast<uint64_t>(i) * 4096;
+        if (off + 512 <= 1024 * 1024) {
+          c.writePlain(off, data.data(), data.size());
+        }
+      }
+    });
+  }
+  for (auto &w : workers) w.join();
+  c.close();
+
+  // Reopen and verify a sample write
+  Container verify;
+  if (!verify.openEncrypted(encPath.wstring(), kPassword, L"")) {
+    std::wcerr << L"[selftest] v5-concurrent: reopen failed" << std::endl;
+    return false;
+  }
+  std::vector<uint8_t> readBuf(512);
+  if (!verify.readPlain(4096, readBuf.data(), readBuf.size())) {
+    std::wcerr << L"[selftest] v5-concurrent: read failed" << std::endl;
+    return false;
+  }
+  // Any of the 8 thread patterns is acceptable
+  bool found = false;
+  for (int t = 0; t < 8; ++t) {
+    bool match = true;
+    for (size_t i = 0; i < readBuf.size(); ++i) {
+      if (readBuf[i] != static_cast<uint8_t>(t + 1)) { match = false; break; }
+    }
+    if (match) { found = true; break; }
+  }
+  if (!found) {
+    std::wcerr << L"[selftest] v5-concurrent: data mismatch" << std::endl;
+    return false;
+  }
+  verify.close();
+  return true;
+}
+
+// v5 read/write consistency: write known pattern, read back and verify
+bool testV5ReadWriteConsistency(const std::filesystem::path &dir) {
+  auto plainPath = dir / L"v5-consistency.vhd";
+  auto encPath = dir / L"v5-consistency.evhd";
+  auto plain = makeMbrPlain();
+  if (!writeFile(plainPath, plain)) return false;
+
+  Container created;
+  if (!created.createFromPlainVhd(plainPath.wstring(), encPath.wstring(), kPassword, L"")) {
+    std::wcerr << L"[selftest] v5-consistency: create failed" << std::endl;
+    return false;
+  }
+  created.close();
+
+  // Write at various offsets
+  Container writer;
+  if (!writer.openEncrypted(encPath.wstring(), kPassword, L"")) {
+    std::wcerr << L"[selftest] v5-consistency: writer open failed" << std::endl;
+    return false;
+  }
+
+  std::vector<uint8_t> patternA = makePattern(512, 0xA1);
+  std::vector<uint8_t> patternB = makePattern(4096, 0xB2);
+  std::vector<uint8_t> patternC = makePattern(64, 0xC3);
+  if (!writer.writePlain(0, patternA.data(), patternA.size())) {
+    std::wcerr << L"[selftest] v5-consistency: writePlain A failed" << std::endl;
+    return false;
+  }
+  if (!writer.writePlain(512, patternB.data(), patternB.size())) {
+    std::wcerr << L"[selftest] v5-consistency: writePlain B failed" << std::endl;
+    return false;
+  }
+  // Write patternC at offset 8192 to avoid overlapping with patternA/B
+  if (!writer.writePlain(8192, patternC.data(), patternC.size())) {
+    std::wcerr << L"[selftest] v5-consistency: writePlain C failed" << std::endl;
+    return false;
+  }
+  writer.close();
+
+  // Read back and verify
+  Container reader;
+  if (!reader.openEncrypted(encPath.wstring(), kPassword, L"")) {
+    std::wcerr << L"[selftest] v5-consistency: reader open failed" << std::endl;
+    return false;
+  }
+
+  std::vector<uint8_t> readA(512), readB(4096), readC(64);
+  if (!reader.readPlain(0, readA.data(), readA.size())) {
+    std::wcerr << L"[selftest] v5-consistency: readPlain A failed" << std::endl;
+    reader.close();
+    return false;
+  }
+  if (!reader.readPlain(512, readB.data(), readB.size())) {
+    std::wcerr << L"[selftest] v5-consistency: readPlain B failed" << std::endl;
+    reader.close();
+    return false;
+  }
+  if (!reader.readPlain(8192, readC.data(), readC.size())) {
+    std::wcerr << L"[selftest] v5-consistency: readPlain C failed" << std::endl;
+    reader.close();
+    return false;
+  }
+  reader.close();
+
+  if (readA != patternA) {
+    std::wcerr << L"[selftest] v5-consistency: patternA mismatch" << std::endl;
+    return false;
+  }
+  if (readB != patternB) {
+    std::wcerr << L"[selftest] v5-consistency: patternB mismatch" << std::endl;
+    return false;
+  }
+  if (readC != patternC) {
+    std::wcerr << L"[selftest] v5-consistency: patternC mismatch" << std::endl;
+    return false;
+  }
+  return true;
+}
+
 } // namespace
 
 int wmain() {
@@ -452,6 +747,36 @@ int wmain() {
 
   if (!testPendingJournalRecovery(dir)) {
     std::wcerr << L"[selftest] journal recovery test failed" << std::endl;
+    return 1;
+  }
+
+  if (!testV4BackwardCompat(dir)) {
+    std::wcerr << L"[selftest] v4 backward compat test failed" << std::endl;
+    return 1;
+  }
+
+  if (!testV5HeaderHmacTamper(dir)) {
+    std::wcerr << L"[selftest] v5 header HMAC tamper test failed" << std::endl;
+    return 1;
+  }
+
+  if (!testV5PadHmacTamper(dir)) {
+    std::wcerr << L"[selftest] v5 pad HMAC tamper test failed" << std::endl;
+    return 1;
+  }
+
+  if (!testV5JournalHmacTamper(dir)) {
+    std::wcerr << L"[selftest] v5 journal HMAC tamper test failed" << std::endl;
+    return 1;
+  }
+
+  if (!testV5ConcurrentWrites(dir)) {
+    std::wcerr << L"[selftest] v5 concurrent writes test failed" << std::endl;
+    return 1;
+  }
+
+  if (!testV5ReadWriteConsistency(dir)) {
+    std::wcerr << L"[selftest] v5 read/write consistency test failed" << std::endl;
     return 1;
   }
 

@@ -26,15 +26,19 @@ public:
 
   bool init(const std::wstring &password, const Params &params);
 
+  // v5: dual-key derivation (aesKey + hmacKey)
+  bool initV5(const std::wstring &password, const Params &params);
+
   // In-place decrypt/encrypt using AES-256-CTR with per-block IV derived from file offset
   bool decryptRange(uint64_t fileOffset, uint8_t *buffer, size_t length);
   bool encryptRange(uint64_t fileOffset, uint8_t *buffer, size_t length);
 
-  bool isReady() const { return m_ready; }
+  // v5: HMAC-SHA256 for data authentication
+  bool hmacData(const uint8_t *data, size_t length, std::vector<uint8_t> &tagOut) const;
+  bool verifyHmac(const uint8_t *data, size_t length, const uint8_t *tag) const;
 
-  // Debug-only: return first 8 bytes of derived key as fingerprint
-  // Never used for cryptographic purposes; helps diagnose KDF consistency.
-  std::array<uint8_t, 8> keyPrefix8() const;
+  bool isReady() const { return m_ready; }
+  bool isV5() const { return m_v5; }
 
 private:
   bool deriveKey(const std::wstring &password, const Params &params,
@@ -50,5 +54,7 @@ private:
   std::vector<uint8_t> m_key; // 32 bytes
   std::vector<uint8_t> m_nonce; // 16 bytes
   std::vector<uint8_t> m_keyObject; // must live as long as m_aesKey
+  std::vector<uint8_t> m_hmacKey; // 32 bytes, v5 only
   bool m_ready{false};
+  bool m_v5{false};
 };

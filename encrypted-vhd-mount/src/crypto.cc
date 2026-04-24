@@ -31,6 +31,15 @@ CryptoContext::~CryptoContext() {
   }
   if (!m_key.empty()) {
     SecureZeroMemory(m_key.data(), m_key.size());
+    m_key.clear();
+  }
+  if (!m_keyObject.empty()) {
+    SecureZeroMemory(m_keyObject.data(), m_keyObject.size());
+    m_keyObject.clear();
+  }
+  if (!m_hmacKey.empty()) {
+    SecureZeroMemory(m_hmacKey.data(), m_hmacKey.size());
+    m_hmacKey.clear();
   }
 }
 
@@ -126,6 +135,28 @@ static bool hmacSha256(const std::vector<uint8_t> &key, const std::vector<uint8_
   BCryptDestroyHash(hHash);
   BCryptCloseAlgorithmProvider(hAlg, 0);
   return status == 0;
+}
+
+bool CryptoContext::initV5(const std::wstring &password, const Params &params) {
+  // First do standard init to derive masterKey -> m_key
+  if (!init(password, params)) return false;
+
+  // Derive hmacKey = HMAC-SHA256(masterKey, "hmac-auth-v5" || nonce)
+  std::vector<uint8_t> prk = m_key; // masterKey reused as PRK
+  const char label[] = "hmac-auth-v5";
+  std::vector<uint8_t> info;
+  info.insert(info.end(), reinterpret_cast<const uint8_t*>(label),
+              reinterpret_cast<const uint8_t*>(label) + sizeof(label) - 1);
+  info.insert(info.end(), params.nonce.begin(), params.nonce.end());
+
+  m_hmacKey.resize(32);
+  if (!hmacSha256(prk, info, m_hmacKey)) {
+    SecureZeroMemory(m_hmacKey.data(), m_hmacKey.size());
+    m_hmacKey.clear();
+    return false;
+  }
+  m_v5 = true;
+  return true;
 }
 
 bool CryptoContext::deriveKey(const std::wstring &password, const Params &params,
@@ -290,11 +321,39 @@ bool CryptoContext::encryptRange(uint64_t fileOffset, uint8_t *buffer, size_t le
   return aesCtrCrypt(fileOffset, buffer, length);
 }
 
-std::array<uint8_t, 8> CryptoContext::keyPrefix8() const {
-  std::array<uint8_t, 8> fp{};
-  if (!m_key.empty()) {
-    size_t take = (m_key.size() < fp.size()) ? m_key.size() : fp.size();
-    memcpy(fp.data(), m_key.data(), take);
+bool CryptoContext::hmacData(const uint8_t *data, size_t length, std::vector<uint8_t> &tagOut) const {
+  tagOut.assign(32, 0);
+  if (!m_v5 || m_hmacKey.empty()) return false;
+  BCRYPT_ALG_HANDLE hAlg = nullptr;
+  NTSTATUS status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG);
+  if (status != 0) return false;
+  DWORD objLen = 0, cbRes = 0, hashLen = 0;
+  status = BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&objLen, sizeof(objLen), &cbRes, 0);
+  if (status != 0) { BCryptCloseAlgorithmProvider(hAlg, 0); return false; }
+  status = BCryptGetProperty(hAlg, BCRYPT_HASH_LENGTH, (PUCHAR)&hashLen, sizeof(hashLen), &cbRes, 0);
+  if (status != 0 || hashLen != 32) { BCryptCloseAlgorithmProvider(hAlg, 0); return false; }
+  std::vector<uint8_t> obj(objLen);
+  BCRYPT_HASH_HANDLE hHash = nullptr;
+  status = BCryptCreateHash(hAlg, &hHash, obj.data(), objLen,
+                            (PUCHAR)m_hmacKey.data(), (ULONG)m_hmacKey.size(), 0);
+  if (status != 0) { BCryptCloseAlgorithmProvider(hAlg, 0); return false; }
+  status = BCryptHashData(hHash, (PUCHAR)data, (ULONG)length, 0);
+  if (status != 0) { BCryptDestroyHash(hHash); BCryptCloseAlgorithmProvider(hAlg, 0); return false; }
+  status = BCryptFinishHash(hHash, (PUCHAR)tagOut.data(), (ULONG)tagOut.size(), 0);
+  if (status != 0) { BCryptDestroyHash(hHash); BCryptCloseAlgorithmProvider(hAlg, 0); return false; }
+  BCryptDestroyHash(hHash);
+  BCryptCloseAlgorithmProvider(hAlg, 0);
+  return true;
+}
+
+bool CryptoContext::verifyHmac(const uint8_t *data, size_t length, const uint8_t *tag) const {
+  if (!tag) return false;
+  std::vector<uint8_t> computed(32);
+  if (!hmacData(data, length, computed)) return false;
+  // Constant-time comparison to prevent timing attacks
+  uint8_t diff = 0;
+  for (size_t i = 0; i < 32; ++i) {
+    diff |= (computed[i] ^ tag[i]);
   }
-  return fp;
+  return diff == 0;
 }
