@@ -35,3 +35,7 @@ tmp*
 test.evhd
 build/selftest_tmp/*
 selftest_tmp
+
+# Security audit and fix plan work documents
+SECURITY_AUDIT.md
+SECURITY_FIX_PLAN.md
