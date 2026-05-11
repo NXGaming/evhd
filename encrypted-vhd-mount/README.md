@@ -1,27 +1,33 @@
 # encrypted-vhd-mount
 
-一个支持流式加解密的VHD处理程序：将VHD以AES-256-CTR加密（PBKDF2密码派生），并通过Dokan桥接提供一个“解密视图文件”，无需解密到临时文件即可被系统直接访问与挂载。
+一个支持流式加解密的VHD处理程序：将VHD以AES-256-CTR加密（PBKDF2密码派生），并通过Dokan桥接提供一个"解密视图文件"，无需解密到临时文件即可被系统直接访问与挂载。当前默认创建 v5 容器，以 HMAC-SHA256 提供端到端的完整性与防篡改保护。
 
 ## 依赖
 
 - Dokan v2（已在本仓库的 `third_party/Dokan/` 集成）
 - Windows CNG (`bcrypt`) 库
-- CMake 3.10+，Visual Studio 2019
+- CMake 3.15+，Visual Studio 2019 及以上
 
 ## 构建
 
 ```powershell
 mkdir encrypted-vhd-mount\build
 cd encrypted-vhd-mount\build
-cmake .. -G "Visual Studio 16 2019"
+cmake .. -G "Visual Studio 17 2022" -A x64
 cmake --build . --config Release
 ```
+
+CMake 配置共生成三个目标：
+
+- `encrypted-vhd-mount.exe`：CLI 主程序，负责创建（`/init`）与挂载（Dokan）。
+- `evhd-bench.exe`：脱离 Dokan 直接对 `Container` 进行顺序/随机读基准。
+- `evhd-selftest.exe`：内建自检套件（同名 CTest 用例），覆盖 v4/v5 兼容、HMAC 篡改检测、journal 回放、并发读写一致性等；可在构建目录下用 `ctest -C Release` 执行。
 
 ## 使用
 
 ### 初始化加密
 
-将明文VHD加密为EVHD文件（包含头部、盐值与随机IV），加密为流式进行，无需一次性加载整文件。
+将明文VHD加密为EVHD文件（包含头部、盐值、随机IV、HMAC 完整性指纹），加密为流式进行，无需一次性加载整文件。
 
 ```powershell
 "YourPassword" | encrypted-vhd-mount.exe /init c:\path\to\plain.vhd /o c:\path\to\encrypted.evhd --password-stdin
@@ -50,14 +56,17 @@ encrypted-vhd-mount.exe /k c:\path\to\keyfile.bin c:\path\to\encrypted.evhd M:\
 - `M:\` 可以是盘符或NTFS文件夹路径。
 - 若容器头部包含原始文件名元数据，则挂载盘内文件名会显示为该原始名；否则默认展示为 `decrypted.vhd`。
 - 当前版本默认启用崩溃恢复 Journal：每次写请求都会先把将要写入的密文记录到同目录 sidecar journal，再落盘到主容器；若机台直接断电，下次打开时会自动回放未完成事务并提示上次是异常关闭。
+- 程序会用 `SecureZeroMemory` 在退出与失败路径主动擦除驻留在内存中的密码与密钥派生中间量。
 
 ### 密钥派生（KDF）
 
 本工具支持三种KDF方法，可根据输入自动选择或由容器记录在头部以便解密端复现：
 
 - `KDF_PASSWORD`：仅密码派生，`PBKDF2-HMAC-SHA256(password, salt, iterations)` → 32字节密钥。
-- `KDF_KEYFILE`：仅密钥文件，`SHA256(keyfile)` 作为 PBKDF2 的“密码”输入。
+- `KDF_KEYFILE`：仅密钥文件，`SHA256(keyfile)` 作为 PBKDF2 的"密码"输入。
 - `KDF_PASSWORD_PLUS_KEYFILE`：组合派生，先用密码PBKDF2得到 `pbkdfKey`，再计算 `finalKey = HMAC-SHA256(key=digest(keyfile), data=pbkdfKey||salt||nonce)`。
+
+v5 容器在派生出 32 字节主密钥后，再经一次 `hmacKey = HMAC-SHA256(masterKey, "hmac-auth-v5" || nonce)` 派生独立的认证密钥；AES-256-CTR 仍使用主密钥，所有 HMAC-SHA256 计算改用 `hmacKey`，避免认证密钥与加密密钥混用。
 
 ### 挂载VHD到系统（可选）
 
@@ -71,63 +80,63 @@ Mount-VHD -Path "M:\\decrypted.vhd" -ReadOnly:$false
 
 ## 格式说明
 
-EVHD 文件头（逐版本扩展）：
+EVHD 文件头（逐版本扩展，所有偏移按"逐字段布局"计算，不依赖 `sizeof(Header)`）：
 
-- 公共字段（v1/v2/v3）：
+- 公共字段（v1+）：
   - `magic[8] = "EVHD0001"`
-  - `version`
+  - `version`（当前默认创建 `5`，仍可读取 v1–v4）
   - `kdfIterations`（默认 200000）
   - `originalSize`（明文 VHD 大小）
   - `salt[16]`（PBKDF2 盐）
   - `nonce[16]`（AES-CTR IV 基）
-- v2：在头部之后追加“原始文件名元数据”：`nameLen(4B)` + `name(wchar_t[nameLen])`
-- v3：在 v1 字段后新增 `kdfMethod(4B)`，再追加与 v2 相同的文件名元数据。
+- v2 起：在 v1 字段之后追加"原始文件名元数据"：`nameLen(4B)` + `name(wchar_t[nameLen])`。
+- v3 起：在 v1 字段之后、文件名元数据之前新增 `kdfMethod(4B)`。
+- v4 起：在 v3 之上追加：
+  - 重定位元数据：`count(4B)` + `entries[count]`，每条 `logicalOffset(8B)` + `length(8B)` + `physicalOffset(8B)`，用于将分区表等敏感范围剪切到尾部。
+  - 填充指纹：`padSalt(16B)` + `padCRC32(4B)`，用于打开时校验主负载中剪切位置的伪随机填充。
+- v5 起：用 HMAC 替代 CRC，并新增 payload 认证扩展：
+  - `padHmac(32B)` 取代 `padCRC32(4B)`。
+  - `authBlockSize(4B)`：payload 认证块大小，`0` 表示禁用整体 payload 认证；当前 `/init` 默认写入 `0`，把性能保留为优先项。
+  - `headerHmac(32B)`：覆盖前述全部头部字段（含 v5 的 `authBlockSize`）的 HMAC-SHA256。
+  - `relocAuthCount(4B)` + `relocAuthHmacs[relocAuthCount]`（每条 32B）：每个重定位条目对应一条覆盖 `physOffset || cipherText` 的 HMAC，挂载时逐条校验。
 
-- v4：在 v3 基础上追加两部分：
-  - 重定位元数据：`count(4B)` + `entries[count]`，每个条目为 `logicalOffset(8B)` + `length(8B)` + `physicalOffset(8B)`，用于将分区表等敏感范围剪切到尾部。
-  - 填充指纹：`padSalt(16B)` + `padCRC32(4B)`，用于打开时的完整性校验（验证主负载中剪切位置的伪随机填充是否未被破坏）。
-
-负载起始偏移（payloadOffset）：
-
-- v1：`56` 字节（基础头大小）。
-- v2：`56 + 4 + nameLen * sizeof(wchar_t)`。
-- v3：`56 + 4(kdfMethod) + 4 + nameLen * sizeof(wchar_t)`。
-
-- v4：`v3 + 4(count) + count * (8*3) + 16(padSalt) + 4(padCRC32)`。
-
-负载部分为密文，按偏移基于 CTR 计数进行随机访问解密/加密。
+负载部分为密文，按偏移基于 CTR 计数进行随机访问解密/加密。当 `authBlockSize > 0` 时，紧随 payload 之后再追加 `payloadAuthTags`：每 `authBlockSize` 字节一个 32B HMAC，挂载时按需校验所读取的块。
 
 ### Journal 与异常断电恢复
 
-- 与主 EVHD 文件同目录会维护一个 sidecar journal 文件：`<container>.journal`。
+- 与主 EVHD 文件同目录会维护一个 sidecar journal 文件：`<container>.journal`，magic 为 `EVJN0001`，文件标记为 hidden、`FILE_FLAG_WRITE_THROUGH`。
 - 每次写入都会先把目标物理偏移和对应密文写入 journal，`FlushFileBuffers` 确认落盘后，才会更新主容器；主容器写完并刷盘后，再把 journal 清空。
+- v5 容器在 journal 末尾再附加两条 32B HMAC：分别覆盖 entries 数组与 payload 数据；回放前以 `hmacKey` 重算并比对，发现篡改即整体拒绝挂载，不会写入伪造数据。v4 容器仍走 CRC32 路径以保持兼容。
 - 若机台在写入中途直接断电，下次打开容器时会先检查 journal：
   - 如果发现 `dirty` 但没有待提交事务，会提示上次不是正常关闭；
-  - 如果发现待提交事务，会自动回放事务到主容器，再继续正常挂载。
+  - 如果发现待提交事务（`state == PREPARED` 且 `entryCount > 0`），会自动回放事务到主容器，再继续正常挂载。
 - 这套机制保护的是整个解密视图镜像的写入路径，而不是仅保护 GPT/MBR 重定位区。
 - 它能显著降低突然断电导致的镜像内部不一致，但仍不能替代底层存储设备自身的原子写保证；如果硬件在单个物理扇区写入内部就断电，仍可能出现设备层面的撕裂写风险。
 
 ### 重定位与剪切
 
 - 为隐藏分区表等结构，创建阶段会将若干逻辑范围（如 `MBR 446..509`、`GPT LBA1 头`、`GPT 分区项`、`备份 GPT` 等）剪切到密文尾部，并在主负载原位置用伪随机填充替换。
-- 剪切范围的真实数据在尾部以 `physicalOffset` 形式存放；读写时通过“逻辑→物理”映射保证 CTR 偏移使用物理位置，从而解密/加密正确。
+- 剪切范围的真实数据在尾部以 `physicalOffset` 形式存放；读写时通过"逻辑→物理"映射保证 CTR 偏移使用物理位置，从而解密/加密正确。
+- v5 容器对每个剪切片段额外保存一条 HMAC（覆盖 `physOffset || ciphertext`），任何外部对剪切区域的篡改在挂载时即被发现。
 
-### 打开时完整性校验（严格模式）
+### 打开时完整性校验（v5 严格模式）
 
-- 打开 EVHD 时，程序会：
-  - 遍历所有剪切的逻辑范围，从“主负载区”位置读取密文；
-  - 以逻辑偏移作为 CTR 偏移解密得到伪随机填充；
-  - 对填充内容计算 CRC32 并与头部记录的 `padCRC32` 比对。
-- 若不一致或读取/解密失败，视为完整性校验失败，当前版本会直接拒绝挂载并返回错误。
-- 常见原因：
-  - 使用旧版本创建的 EVHD（头部布局与偏移计算不一致）；
-  - 密文主负载被安全软件或其他程序写入/篡改；
-  - 密码或密钥文件与容器记录的 KDF 方法不匹配。
+挂载 v5 容器时按以下顺序进行强校验，任何一步失败都会直接拒绝挂载：
+
+1. 读取头部全部字段（含 `padHmac`、`headerHmac`、`relocAuthHmacs` 等占位）。
+2. 打开 sidecar journal，若发现 `state == PREPARED` 则立即回放未提交事务到主容器，再清理脏标志。
+3. 经 KDF 派生主密钥与 `hmacKey`。
+4. 用 `hmacKey` 重算 `headerHmac` 并以常量时间比对。
+5. 若 `authBlockSize > 0`，加载尾部的 `payloadAuthTags`（每读取一块时再做单块 HMAC 校验）。
+6. 遍历所有剪切的逻辑范围，按逻辑偏移作为 CTR 偏移解密得到伪随机填充，将所得字节流统一计算 HMAC 并与头部记录的 `padHmac` 做常量时间比对。
+
+v4 容器在打开时仍按原 `padCRC32` 行为进行校验；既有数据可继续打开，但建议升级到 v5 以获得真正的完整性保证。
 
 ### 升级与兼容性
 
-- 旧版本创建的 EVHD 文件可能无法通过新的完整性校验。请使用新可执行文件重新初始化（`/init`）生成新的 EVHD 后再挂载。
-- 创建与读取侧的 `payloadOffset` 计算已统一为“逐字段布局”（不使用结构体 `sizeof`），避免对齐差导致的偏移误差。
+- 程序仍能读取 v1–v4 容器，但只有 v5 启用 HMAC 防篡改与 journal 认证。
+- 旧版本（v1–v3）创建的 EVHD 通常会因为完整性指纹缺失或 `payloadOffset` 计算差异而拒绝挂载，请用新可执行文件重新执行 `/init` 生成 v5 容器。
+- 创建与读取侧的 `payloadOffset` 计算已统一为"逐字段布局"（不使用结构体 `sizeof`），避免对齐差导致的偏移误差。
 
 ### DirectIO 模式与性能优化
 
@@ -135,7 +144,7 @@ EVHD 文件头（逐版本扩展）：
 
 - `/direct` 参数启用 directIO 模式，绕过 Windows 文件系统缓存，直接访问底层加密容器文件。
 - **优势**：减少内存拷贝开销，在大文件顺序读写场景下可显著提升性能。
-- **注意**：directIO 要求读写偏移和长度必须按扇区（512字节）对齐。
+- **注意**：directIO 要求读写偏移和长度必须按扇区对齐；程序会查询 `FileAlignmentInfo` 与卷 `BytesPerSector`，自动取较大者作为对齐单位。
 
 #### EOF 边界处理
 
@@ -145,7 +154,7 @@ EVHD 文件头（逐版本扩展）：
 
 #### 性能基准测试
 
-推荐使用 DiskSpd 进行真实性能测试（禁用缓存）：
+仓库内构建出的 `evhd-bench.exe` 提供独立于 Dokan 的 `Container` 层基准。完整端到端 I/O 仍建议用 DiskSpd（禁用缓存）跑实际挂载盘：
 
 ```powershell
 # 顺序读测试（1MB 块，32 队列深度，4 线程，30秒）
@@ -166,7 +175,7 @@ diskspd -b4K -d30 -o32 -t4 -w100 -Sh -Su -c4G M:\benchfile.dat
 - 随机 4K Q1T1：几十 MB/s
 - 随机 4K Q32T16：几百 MB/s
 
-**注意**：CrystalDiskMark 等工具的顺序读数值可能因 Windows 缓存而虚高，建议使用 DiskSpd 的 `-Sh -Su` 参数禁用缓存获得真实结果。
+**注意**：CrystalDiskMark 等工具的顺序读数值可能因 Windows 缓存而虚高，建议使用 DiskSpd 的 `-Sh -Su` 参数禁用缓存获得真实结果。如启用 `authBlockSize > 0` 的 payload 认证，会按块产生额外 HMAC 校验开销，请按场景权衡。
 
 ### 故障排查
 
@@ -175,10 +184,10 @@ diskspd -b4K -d30 -o32 -t4 -w100 -Sh -Su -c4G M:\benchfile.dat
 - 启用 `/d` 查看调试日志，关注：
   - `version`、`payloadOffset`、`relocCount`；
   - `kdf salt/nonce/key[0..7]` 指纹是否正常输出；
-  - 完整性校验：`integrity check OK` 或 `FAILED` 以及期望/实际 CRC32。
+  - 完整性校验：`integrity check OK` 或具体失败位置（v5 会指明 `header HMAC verification FAILED`、`padHMAC mismatch`、`journal entries/data HMAC verification FAILED` 之一）。
 - 若失败：
-  - 确认使用最新 `encrypted-vhd-mount.exe` 重新执行 `/init`；
-  - 排除磁盘/安全软件对 EVHD 主负载的写入；
+  - 确认使用最新 `encrypted-vhd-mount.exe` 重新执行 `/init` 生成 v5 容器；
+  - 排除磁盘/安全软件对 EVHD 主负载或 sidecar journal 的写入；
   - 检查密码/密钥文件路径与 KDF 方法是否一致。
 
 #### DirectIO 相关问题
@@ -186,12 +195,12 @@ diskspd -b4K -d30 -o32 -t4 -w100 -Sh -Su -c4G M:\benchfile.dat
 - **挂载失败或读取错误**：
   - 检查日志中是否有 `[evhd] readRawPhys fail` 错误（已在新版本修复）。
   - 确认使用最新版本，旧版本在 directIO 模式下可能在文件尾部读取失败。
-  
+
 - **性能不如预期**：
   - 确认已使用 `/direct` 参数启用 directIO 模式。
   - 使用 DiskSpd 而非 CrystalDiskMark 进行基准测试，后者可能受缓存影响。
   - 检查 CPU 是否支持 AES-NI 指令集，影响加解密性能。
-  
+
 - **日志中出现 EOF 回退提示**：
   - `[evhd] unbuffered read touches EOF. Falling back to buffered path.` 是正常行为。
   - 这表明程序正确处理了文件尾部的非对齐读取，不影响功能和整体性能。
@@ -199,6 +208,7 @@ diskspd -b4K -d30 -o32 -t4 -w100 -Sh -Su -c4G M:\benchfile.dat
 ## 构建与编码提示
 
 - 如出现 MSVC `C4819` 编码警告，请将源文件保存为 UTF-8（建议无 BOM）。
+- 项目对 `dokan2.dll` 启用了 `/DELAYLOAD`：未安装 Dokan v2 时进程不会在加载阶段静默退出，而是给出明确错误。
 
 ## 注意事项
 
