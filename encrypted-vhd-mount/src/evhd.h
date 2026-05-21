@@ -3,8 +3,11 @@
 #pragma once
 
 #include <cstdint>
+#include <atomic>
 #include <fstream>
+#include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <array>
 #include <vector>
@@ -12,6 +15,8 @@
 #include <Windows.h>
 
 #include "crypto.h"
+#include "range_lock.h"
+#include "journal_batcher.h"
 
 namespace evhd {
 
@@ -75,6 +80,8 @@ public:
 private:
   bool readHeader();
   bool writeHeader();
+  bool flushInternal(); // flush without acquiring m_rwMutex (caller must hold lock)
+  void closeInternal(); // close without acquiring m_rwMutex (caller must hold lock)
   // 读取/写入时将逻辑范围拆分为一个或多个物理片段（考虑重定位覆盖）
   void mapLogicalToPhysical(uint64_t logicalOffset, size_t length,
                             std::vector<RelocEntry> &outSegments) const;
@@ -86,9 +93,11 @@ private:
   bool writeJournalHeader(bool flushToDisk, bool trimToHeader);
   bool ensureJournalDirty();
   bool clearJournalState(bool dirtyFlag);
+  bool clearJournalStateNoFlush();
   bool recoverPendingJournal();
   bool prepareJournalTransaction(const std::vector<RelocEntry> &segments,
-                                 const std::vector<uint8_t> &ciphertext);
+                                 const std::vector<uint8_t> &ciphertext,
+                                 bool flushAfter = true);
   void closeJournal(bool cleanShutdown);
 
   // v5: HMAC helpers
@@ -127,9 +136,11 @@ private:
   std::fstream m_file;
   HANDLE m_handle{INVALID_HANDLE_VALUE};
   HANDLE m_journalHandle{INVALID_HANDLE_VALUE};
-  std::recursive_mutex m_mutex;
+  std::shared_mutex m_rwMutex;
+  RangeLock m_rangeLock;
+  std::mutex m_fstreamMutex; // protects m_file for unbuffered EOF fallback reads
   CryptoContext m_crypto;
-  bool m_ready{false};
+  std::atomic<bool> m_ready{false};
   bool m_debug{false};
   bool m_previousSessionDirty{false};
   bool m_recoveredPendingJournal{false};
@@ -149,6 +160,13 @@ private:
   uint64_t m_payloadAuthTagsOffset{0}; // absolute file offset of auth tags
   bool m_unbuffered{false};
   uint32_t m_sectorSize{4096};
+  // Memory-mapped I/O for fast reads (buffered mode only)
+  HANDLE m_mappingHandle{nullptr};
+  const uint8_t *m_mappedView{nullptr};
+  uint64_t m_mappedSize{0};
+  // JournalBatcher for group-commit write batching
+  std::unique_ptr<JournalBatcher> m_batcher;
+  void initBatcher();
   // 原生偏移式I/O（Overlapped）辅助
   bool readRawPhys(uint64_t physOffset, uint8_t *dst, size_t len);
   bool writeRawPhys(uint64_t physOffset, const uint8_t *src, size_t len);

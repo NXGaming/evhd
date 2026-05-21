@@ -2,6 +2,8 @@
 
 #include "evhd.h"
 
+#include "vmprotect_scope.h"
+
 #include <random>
 #include <cstring>
 #include <iostream>
@@ -164,8 +166,8 @@ static uint64_t getHandleSize(HANDLE handle) {
 
 bool Container::openEncrypted(const std::wstring &path, const std::wstring &password,
                               const std::wstring &keyFilePath) {
-  std::lock_guard<std::recursive_mutex> lg(m_mutex);
-  close();
+  std::unique_lock<std::shared_mutex> ul(m_rwMutex);
+  closeInternal();
   m_path = path;
   m_previousSessionDirty = false;
   m_recoveredPendingJournal = false;
@@ -318,14 +320,40 @@ bool Container::openEncrypted(const std::wstring &path, const std::wstring &pass
   }
 
   m_ready = true;
+
+  // Create memory mapping for fast reads (buffered mode only).
+  // This eliminates kernel transitions for read I/O by mapping the file directly.
+  if (!m_unbuffered && m_handle != INVALID_HANDLE_VALUE) {
+    LARGE_INTEGER fileSize{};
+    if (GetFileSizeEx(m_handle, &fileSize) && fileSize.QuadPart > 0) {
+      m_mappingHandle = CreateFileMappingW(m_handle, nullptr, PAGE_READWRITE, 0, 0, nullptr);
+      if (m_mappingHandle) {
+        m_mappedView = static_cast<const uint8_t*>(
+            MapViewOfFile(m_mappingHandle, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0));
+        if (m_mappedView) {
+          m_mappedSize = static_cast<uint64_t>(fileSize.QuadPart);
+        } else {
+          CloseHandle(m_mappingHandle);
+          m_mappingHandle = nullptr;
+        }
+      }
+    }
+  }
+
+  // Initialize the JournalBatcher for group-commit write batching
+  // (only if journal is available — v4+ containers with successful journal init)
+  if (m_journalHandle != INVALID_HANDLE_VALUE) {
+    initBatcher();
+  }
+
   return true;
 }
 
 bool Container::createFromPlainVhd(const std::wstring &plainVhdPath, const std::wstring &encOutPath,
                                    const std::wstring &password, const std::wstring &keyFilePath,
                                    uint32_t iterations, uint32_t targetVersion) {
-  std::lock_guard<std::recursive_mutex> lg(m_mutex);
-  close();
+  std::unique_lock<std::shared_mutex> ul(m_rwMutex);
+  closeInternal();
   m_path = encOutPath;
   m_previousSessionDirty = false;
   m_recoveredPendingJournal = false;
@@ -341,233 +369,238 @@ bool Container::createFromPlainVhd(const std::wstring &plainVhdPath, const std::
   m_file.open(encOutPath.c_str(), std::ios::binary | std::ios::in | std::ios::out | std::ios::trunc);
   if (!m_file.is_open()) return false;
 
-  // Prepare header
-  memset(&m_header, 0, sizeof(m_header));
-  memcpy(m_header.magic, MAGIC, sizeof(m_header.magic));
-  m_header.version = targetVersion; // v4 or v5
-  m_header.kdfIterations = iterations;
-  m_header.originalSize = size;
-  m_header.authBlockSize = 0; // disable payload auth tags by default (performance vs security tradeoff)
-  randomBytes(m_header.salt, sizeof(m_header.salt));
-  randomBytes(m_header.nonce, sizeof(m_header.nonce));
-  // decide kdf method
-  if (!keyFilePath.empty() && !password.empty()) m_header.kdfMethod = KDF_PASSWORD_PLUS_KEYFILE;
-  else if (!keyFilePath.empty() && password.empty()) m_header.kdfMethod = KDF_KEYFILE;
-  else m_header.kdfMethod = KDF_PASSWORD;
-
-  // Write header + metadata (original filename)
-  // original name = filename of plainVhdPath
-  std::wstring baseName = std::filesystem::path(plainVhdPath).filename().c_str();
-  m_originalName = baseName;
-  if (!writeHeader()) { std::wcerr << L"EVHD header write failed" << std::endl; return false; }
-  // Compute payload offset using the same layout logic as readHeader
-  struct HeaderV1 { char magic[8]; uint32_t version; uint32_t kdfIterations; uint64_t originalSize; uint8_t salt[16]; uint8_t nonce[16]; };
-  m_payloadOffset = sizeof(HeaderV1);
-  if (m_header.version >= 3) {
-    m_payloadOffset += sizeof(uint32_t); // kdfMethod
-  }
-  if (m_header.version >= 2) {
-    uint32_t nameLen = static_cast<uint32_t>(m_originalName.size());
-    m_file.write(reinterpret_cast<const char*>(&nameLen), sizeof(nameLen));
-    if (nameLen > 0) {
-      m_file.write(reinterpret_cast<const char*>(m_originalName.c_str()), nameLen * sizeof(wchar_t));
-    }
-    if (!m_file) { std::wcerr << L"Write metadata (filename) failed" << std::endl; return false; }
-    m_payloadOffset += sizeof(uint32_t) + static_cast<uint64_t>(nameLen) * sizeof(wchar_t);
-  }
-  // v4: 写入重定位条目占位（稍后实际写入前需确定条目），先准备重定位计划
-  // 检测并收集需要剪切的分区表范围
-  const uint64_t sectorSize = 512;
-  struct PlanItem { uint64_t logicalOffset; uint64_t length; };
-  std::vector<PlanItem> plan;
+  std::vector<std::vector<uint8_t>> relocData;
   {
-    // 读取MBR扇区 0 作为判断依据
-    std::vector<uint8_t> sec0(sectorSize);
-    in.read(reinterpret_cast<char*>(sec0.data()), sec0.size());
-    if (!in) { std::wcerr << L"Read sector0 failed" << std::endl; return false; }
-    // 恢复读指针
-    in.seekg(0, std::ios::beg);
-    bool has55AA = (sec0[510] == 0x55 && sec0[511] == 0xAA);
-    if (has55AA) {
-      // MBR分区表条目 446..509 (64字节)。保留签名(510..511)不剪切。
-      plan.push_back({446, 64});
-      // 检测GPT：保护MBR类型0xEE在第一个分区条目
-      bool protectiveGPT = (sec0[446 + 4] == 0xEE);
-      if (protectiveGPT && size >= sectorSize * 2) {
-        // 读取LBA1 GPT头
-        std::vector<uint8_t> gpt(sectorSize);
-        in.seekg(sectorSize, std::ios::beg);
-        in.read(reinterpret_cast<char*>(gpt.data()), gpt.size());
-        if (in) {
-          const char sig[8] = {'E','F','I',' ','P','A','R','T'};
-          if (memcmp(gpt.data(), sig, 8) == 0) {
-            // Partition entries start LBA @ offset 0x48 (uint64), number @ 0x2C (uint32), size @ 0x30 (uint32)
-            uint64_t partStartLBA = *reinterpret_cast<const uint64_t*>(&gpt[0x48]);
-            uint32_t numEntries = *reinterpret_cast<const uint32_t*>(&gpt[0x2C]);
-            uint32_t entrySize = *reinterpret_cast<const uint32_t*>(&gpt[0x30]);
-            bool validLBA = (partStartLBA >= 2) && (partStartLBA < (size / sectorSize));
-            bool validEntrySize = (entrySize >= 128) && (entrySize <= 4096) && (entrySize % 8 == 0);
-            bool validNum = (numEntries > 0) && (numEntries <= 4096);
-            uint64_t gptEntriesOffset = validLBA ? (sectorSize * partStartLBA) : 0;
-            uint64_t entriesBytes = 0;
-            if (validEntrySize && validNum && validLBA) {
-              entriesBytes = static_cast<uint64_t>(numEntries) * entrySize;
-              uint64_t maxBytes = (gptEntriesOffset < size) ? (size - gptEntriesOffset) : 0;
-              if (entriesBytes > maxBytes) entriesBytes = maxBytes;
-            }
-            uint64_t gptHeaderOffset = sectorSize * 1;
-            // 迁移主GPT头 + 主分区表（仅当参数有效且长度>0）
-            plan.push_back({gptHeaderOffset, sectorSize});
-            if (entriesBytes > 0) {
-              plan.push_back({gptEntriesOffset, entriesBytes});
-            }
-            // 处理备份GPT：剪切备份头与备份分区表
-            uint64_t backupLBA = *reinterpret_cast<const uint64_t*>(&gpt[0x20]);
-            uint64_t backupHeaderOffset = sectorSize * backupLBA;
-            if (backupHeaderOffset + sectorSize <= size) {
-              std::vector<uint8_t> gptBackup(sectorSize);
-              in.seekg(static_cast<std::streamoff>(backupHeaderOffset), std::ios::beg);
-              in.read(reinterpret_cast<char*>(gptBackup.data()), gptBackup.size());
-              if (in && memcmp(gptBackup.data(), sig, 8) == 0) {
-                uint64_t backupPartStartLBA = *reinterpret_cast<const uint64_t*>(&gptBackup[0x48]);
-                uint32_t backupNumEntries = *reinterpret_cast<const uint32_t*>(&gptBackup[0x2C]);
-                uint32_t backupEntrySize = *reinterpret_cast<const uint32_t*>(&gptBackup[0x30]);
-                bool bValidLBA = (backupPartStartLBA >= 2) && (backupPartStartLBA < (size / sectorSize));
-                bool bValidEntrySize = (backupEntrySize >= 128) && (backupEntrySize <= 4096) && (backupEntrySize % 8 == 0);
-                bool bValidNum = (backupNumEntries > 0) && (backupNumEntries <= 4096);
-                uint64_t backupEntriesOffset = bValidLBA ? (sectorSize * backupPartStartLBA) : 0;
-                uint64_t backupEntriesBytes = 0;
-                if (bValidEntrySize && bValidNum && bValidLBA) {
-                  backupEntriesBytes = static_cast<uint64_t>(backupNumEntries) * backupEntrySize;
-                  uint64_t bMaxBytes = (backupEntriesOffset < size) ? (size - backupEntriesOffset) : 0;
-                  if (backupEntriesBytes > bMaxBytes) backupEntriesBytes = bMaxBytes;
-                }
-                plan.push_back({backupHeaderOffset, sectorSize});
-                if (backupEntriesBytes > 0) {
-                  plan.push_back({backupEntriesOffset, backupEntriesBytes});
-                }
+    evhd_vmp::Scope scope("container_create_layout", evhd_vmp::Mode::Mutation);
+
+    // Prepare header
+    memset(&m_header, 0, sizeof(m_header));
+    memcpy(m_header.magic, MAGIC, sizeof(m_header.magic));
+    m_header.version = targetVersion; // v4 or v5
+    m_header.kdfIterations = iterations;
+    m_header.originalSize = size;
+    m_header.authBlockSize = 0; // disable payload auth tags by default (performance vs security tradeoff)
+    randomBytes(m_header.salt, sizeof(m_header.salt));
+    randomBytes(m_header.nonce, sizeof(m_header.nonce));
+    // decide kdf method
+    if (!keyFilePath.empty() && !password.empty()) m_header.kdfMethod = KDF_PASSWORD_PLUS_KEYFILE;
+    else if (!keyFilePath.empty() && password.empty()) m_header.kdfMethod = KDF_KEYFILE;
+    else m_header.kdfMethod = KDF_PASSWORD;
+
+    // Write header + metadata (original filename)
+    // original name = filename of plainVhdPath
+    std::wstring baseName = std::filesystem::path(plainVhdPath).filename().c_str();
+    m_originalName = baseName;
+    if (!writeHeader()) { std::wcerr << L"EVHD header write failed" << std::endl; return false; }
+    // Compute payload offset using the same layout logic as readHeader
+    struct HeaderV1 { char magic[8]; uint32_t version; uint32_t kdfIterations; uint64_t originalSize; uint8_t salt[16]; uint8_t nonce[16]; };
+    m_payloadOffset = sizeof(HeaderV1);
+    if (m_header.version >= 3) {
+      m_payloadOffset += sizeof(uint32_t); // kdfMethod
+    }
+    if (m_header.version >= 2) {
+      uint32_t nameLen = static_cast<uint32_t>(m_originalName.size());
+      m_file.write(reinterpret_cast<const char*>(&nameLen), sizeof(nameLen));
+      if (nameLen > 0) {
+        m_file.write(reinterpret_cast<const char*>(m_originalName.c_str()), nameLen * sizeof(wchar_t));
+      }
+      if (!m_file) { std::wcerr << L"Write metadata (filename) failed" << std::endl; return false; }
+      m_payloadOffset += sizeof(uint32_t) + static_cast<uint64_t>(nameLen) * sizeof(wchar_t);
+    }
+    // v4: 写入重定位条目占位（稍后实际写入前需确定条目），先准备重定位计划
+    // 检测并收集需要剪切的分区表范围
+    const uint64_t sectorSize = 512;
+    struct PlanItem { uint64_t logicalOffset; uint64_t length; };
+    std::vector<PlanItem> plan;
+    {
+      // 读取MBR扇区 0 作为判断依据
+      std::vector<uint8_t> sec0(sectorSize);
+      in.read(reinterpret_cast<char*>(sec0.data()), sec0.size());
+      if (!in) { std::wcerr << L"Read sector0 failed" << std::endl; return false; }
+      // 恢复读指针
+      in.seekg(0, std::ios::beg);
+      bool has55AA = (sec0[510] == 0x55 && sec0[511] == 0xAA);
+      if (has55AA) {
+        // MBR分区表条目 446..509 (64字节)。保留签名(510..511)不剪切。
+        plan.push_back({446, 64});
+        // 检测GPT：保护MBR类型0xEE在第一个分区条目
+        bool protectiveGPT = (sec0[446 + 4] == 0xEE);
+        if (protectiveGPT && size >= sectorSize * 2) {
+          // 读取LBA1 GPT头
+          std::vector<uint8_t> gpt(sectorSize);
+          in.seekg(sectorSize, std::ios::beg);
+          in.read(reinterpret_cast<char*>(gpt.data()), gpt.size());
+          if (in) {
+            const char sig[8] = {'E','F','I',' ','P','A','R','T'};
+            if (memcmp(gpt.data(), sig, 8) == 0) {
+              // Partition entries start LBA @ offset 0x48 (uint64), number @ 0x2C (uint32), size @ 0x30 (uint32)
+              uint64_t partStartLBA = *reinterpret_cast<const uint64_t*>(&gpt[0x48]);
+              uint32_t numEntries = *reinterpret_cast<const uint32_t*>(&gpt[0x2C]);
+              uint32_t entrySize = *reinterpret_cast<const uint32_t*>(&gpt[0x30]);
+              bool validLBA = (partStartLBA >= 2) && (partStartLBA < (size / sectorSize));
+              bool validEntrySize = (entrySize >= 128) && (entrySize <= 4096) && (entrySize % 8 == 0);
+              bool validNum = (numEntries > 0) && (numEntries <= 4096);
+              uint64_t gptEntriesOffset = validLBA ? (sectorSize * partStartLBA) : 0;
+              uint64_t entriesBytes = 0;
+              if (validEntrySize && validNum && validLBA) {
+                entriesBytes = static_cast<uint64_t>(numEntries) * entrySize;
+                uint64_t maxBytes = (gptEntriesOffset < size) ? (size - gptEntriesOffset) : 0;
+                if (entriesBytes > maxBytes) entriesBytes = maxBytes;
               }
-              // 恢复读指针
-              in.seekg(0, std::ios::beg);
+              uint64_t gptHeaderOffset = sectorSize * 1;
+              // 迁移主GPT头 + 主分区表（仅当参数有效且长度>0）
+              plan.push_back({gptHeaderOffset, sectorSize});
+              if (entriesBytes > 0) {
+                plan.push_back({gptEntriesOffset, entriesBytes});
+              }
+              // 处理备份GPT：剪切备份头与备份分区表
+              uint64_t backupLBA = *reinterpret_cast<const uint64_t*>(&gpt[0x20]);
+              uint64_t backupHeaderOffset = sectorSize * backupLBA;
+              if (backupHeaderOffset + sectorSize <= size) {
+                std::vector<uint8_t> gptBackup(sectorSize);
+                in.seekg(static_cast<std::streamoff>(backupHeaderOffset), std::ios::beg);
+                in.read(reinterpret_cast<char*>(gptBackup.data()), gptBackup.size());
+                if (in && memcmp(gptBackup.data(), sig, 8) == 0) {
+                  uint64_t backupPartStartLBA = *reinterpret_cast<const uint64_t*>(&gptBackup[0x48]);
+                  uint32_t backupNumEntries = *reinterpret_cast<const uint32_t*>(&gptBackup[0x2C]);
+                  uint32_t backupEntrySize = *reinterpret_cast<const uint32_t*>(&gptBackup[0x30]);
+                  bool bValidLBA = (backupPartStartLBA >= 2) && (backupPartStartLBA < (size / sectorSize));
+                  bool bValidEntrySize = (backupEntrySize >= 128) && (backupEntrySize <= 4096) && (backupEntrySize % 8 == 0);
+                  bool bValidNum = (backupNumEntries > 0) && (backupNumEntries <= 4096);
+                  uint64_t backupEntriesOffset = bValidLBA ? (sectorSize * backupPartStartLBA) : 0;
+                  uint64_t backupEntriesBytes = 0;
+                  if (bValidEntrySize && bValidNum && bValidLBA) {
+                    backupEntriesBytes = static_cast<uint64_t>(backupNumEntries) * backupEntrySize;
+                    uint64_t bMaxBytes = (backupEntriesOffset < size) ? (size - backupEntriesOffset) : 0;
+                    if (backupEntriesBytes > bMaxBytes) backupEntriesBytes = bMaxBytes;
+                  }
+                  plan.push_back({backupHeaderOffset, sectorSize});
+                  if (backupEntriesBytes > 0) {
+                    plan.push_back({backupEntriesOffset, backupEntriesBytes});
+                  }
+                }
+                // 恢复读指针
+                in.seekg(0, std::ios::beg);
+              }
             }
           }
+          // 恢复读指针
+          in.seekg(0, std::ios::beg);
         }
-        // 恢复读指针
-        in.seekg(0, std::ios::beg);
       }
     }
-  }
-  // 计划健壮化：排序、去重并合并重叠区间，过滤非法/零长度条目
-  if (!plan.empty()) {
-    // 过滤非法
-    std::vector<PlanItem> filtered; filtered.reserve(plan.size());
-    for (const auto &pi : plan) {
-      if (pi.length == 0) continue;
-      if (pi.logicalOffset >= size) continue;
-      uint64_t maxLen = size - pi.logicalOffset;
-      uint64_t len = (pi.length > maxLen) ? maxLen : pi.length;
-      if (len == 0) continue;
-      filtered.push_back({pi.logicalOffset, len});
-    }
-    plan.swap(filtered);
+    // 计划健壮化：排序、去重并合并重叠区间，过滤非法/零长度条目
+    if (!plan.empty()) {
+      // 过滤非法
+      std::vector<PlanItem> filtered; filtered.reserve(plan.size());
+      for (const auto &pi : plan) {
+        if (pi.length == 0) continue;
+        if (pi.logicalOffset >= size) continue;
+        uint64_t maxLen = size - pi.logicalOffset;
+        uint64_t len = (pi.length > maxLen) ? maxLen : pi.length;
+        if (len == 0) continue;
+        filtered.push_back({pi.logicalOffset, len});
+      }
+      plan.swap(filtered);
 
-    // 排序
-    std::sort(plan.begin(), plan.end(), [](const PlanItem &a, const PlanItem &b){
-      if (a.logicalOffset == b.logicalOffset) return a.length < b.length;
-      return a.logicalOffset < b.logicalOffset;
-    });
-    // 合并重叠
-    std::vector<PlanItem> merged; merged.reserve(plan.size());
-    for (const auto &pi : plan) {
-      if (merged.empty()) { merged.push_back(pi); continue; }
-      auto &last = merged.back();
-      uint64_t lastEnd = last.logicalOffset + last.length;
-      uint64_t curEnd = pi.logicalOffset + pi.length;
-      if (pi.logicalOffset <= lastEnd) {
-        // 重叠或相邻，合并到更大的范围
-        if (curEnd > lastEnd) {
-          last.length = curEnd - last.logicalOffset;
+      // 排序
+      std::sort(plan.begin(), plan.end(), [](const PlanItem &a, const PlanItem &b){
+        if (a.logicalOffset == b.logicalOffset) return a.length < b.length;
+        return a.logicalOffset < b.logicalOffset;
+      });
+      // 合并重叠
+      std::vector<PlanItem> merged; merged.reserve(plan.size());
+      for (const auto &pi : plan) {
+        if (merged.empty()) { merged.push_back(pi); continue; }
+        auto &last = merged.back();
+        uint64_t lastEnd = last.logicalOffset + last.length;
+        uint64_t curEnd = pi.logicalOffset + pi.length;
+        if (pi.logicalOffset <= lastEnd) {
+          // 重叠或相邻，合并到更大的范围
+          if (curEnd > lastEnd) {
+            last.length = curEnd - last.logicalOffset;
+          }
+        } else {
+          merged.push_back(pi);
         }
+      }
+      plan.swap(merged);
+    }
+    // 为每个条目分配物理存放位置（尾部追加），按512对齐
+    auto align512 = [](uint64_t x) { return (x + 511ULL) & ~511ULL; };
+    uint64_t relocBase = size;
+    uint64_t accum = 0;
+    m_relocations.clear();
+    relocData.reserve(plan.size());
+    for (const auto &pi : plan) {
+      RelocEntry e{}; e.logicalOffset = pi.logicalOffset; e.length = pi.length; e.physicalOffset = align512(relocBase + accum);
+      accum = align512(accum + pi.length);
+      m_relocations.push_back(e);
+      // 捕获原始数据备份
+      std::vector<uint8_t> data(pi.length);
+      in.seekg(static_cast<std::streamoff>(pi.logicalOffset), std::ios::beg);
+      in.read(reinterpret_cast<char*>(data.data()), data.size());
+      if (!in) { std::wcerr << L"Capture relocation bytes failed at logical=" << pi.logicalOffset << L" len=" << pi.length << std::endl; return false; }
+      relocData.push_back(std::move(data));
+    }
+
+    // 诊断：打印将要写入的重定位条目
+    std::wcerr << L"[evhd] create: relocations to write:" << L"\n";
+    for (size_t i = 0; i < m_relocations.size(); ++i) {
+      const auto &e = m_relocations[i];
+      std::wcerr << L"  reloc[" << i << L"] logic=" << e.logicalOffset
+                 << L" len=" << e.length
+                 << L" phys=" << e.physicalOffset << L"\n";
+    }
+    // 写入重定位元数据：count + entries
+    if (m_header.version >= 4) {
+      uint32_t count = static_cast<uint32_t>(m_relocations.size());
+      m_file.write(reinterpret_cast<const char*>(&count), sizeof(count));
+      for (const auto &e : m_relocations) {
+        m_file.write(reinterpret_cast<const char*>(&e.logicalOffset), sizeof(e.logicalOffset));
+        m_file.write(reinterpret_cast<const char*>(&e.length), sizeof(e.length));
+        m_file.write(reinterpret_cast<const char*>(&e.physicalOffset), sizeof(e.physicalOffset));
+      }
+      if (!m_file) { std::wcerr << L"Write relocation metadata failed" << std::endl; return false; }
+      m_payloadOffset += sizeof(uint32_t) + static_cast<uint64_t>(count) * (sizeof(uint64_t) * 3);
+      // v4/v5 扩展：写入填充指纹盐与占位指纹，稍后回填结果
+      randomBytes(m_padSalt, sizeof(m_padSalt));
+      if (m_header.version >= 5) {
+        m_padHmac.assign(32, 0);
+        m_file.write(reinterpret_cast<const char*>(m_padSalt), sizeof(m_padSalt));
+        m_file.write(reinterpret_cast<const char*>(m_padHmac.data()), m_padHmac.size());
+        m_payloadOffset += sizeof(m_padSalt) + m_padHmac.size();
       } else {
-        merged.push_back(pi);
+        uint32_t zeroCRC = 0;
+        m_file.write(reinterpret_cast<const char*>(m_padSalt), sizeof(m_padSalt));
+        m_file.write(reinterpret_cast<const char*>(&zeroCRC), sizeof(zeroCRC));
+        m_payloadOffset += sizeof(m_padSalt) + sizeof(uint32_t);
       }
+      if (!m_file) { std::wcerr << L"Write pad fingerprint failed" << std::endl; return false; }
+      // 诊断：打印写入后的条目数量与负载起始偏移
+      std::wcerr << L"[evhd] create: relocCount=" << count
+                 << L" payloadOffset=" << m_payloadOffset << L"\n";
     }
-    plan.swap(merged);
-  }
-  // 为每个条目分配物理存放位置（尾部追加），按512对齐
-  auto align512 = [](uint64_t x) { return (x + 511ULL) & ~511ULL; };
-  uint64_t relocBase = size;
-  uint64_t accum = 0;
-  m_relocations.clear();
-  std::vector<std::vector<uint8_t>> relocData; relocData.reserve(plan.size());
-  for (const auto &pi : plan) {
-    RelocEntry e{}; e.logicalOffset = pi.logicalOffset; e.length = pi.length; e.physicalOffset = align512(relocBase + accum);
-    accum = align512(accum + pi.length);
-    m_relocations.push_back(e);
-    // 捕获原始数据备份
-    std::vector<uint8_t> data(pi.length);
-    in.seekg(static_cast<std::streamoff>(pi.logicalOffset), std::ios::beg);
-    in.read(reinterpret_cast<char*>(data.data()), data.size());
-    if (!in) { std::wcerr << L"Capture relocation bytes failed at logical=" << pi.logicalOffset << L" len=" << pi.length << std::endl; return false; }
-    relocData.push_back(std::move(data));
-  }
-
-  // 诊断：打印将要写入的重定位条目
-  std::wcerr << L"[evhd] create: relocations to write:" << L"\n";
-  for (size_t i = 0; i < m_relocations.size(); ++i) {
-    const auto &e = m_relocations[i];
-    std::wcerr << L"  reloc[" << i << L"] logic=" << e.logicalOffset
-               << L" len=" << e.length
-               << L" phys=" << e.physicalOffset << L"\n";
-  }
-  // 写入重定位元数据：count + entries
-  if (m_header.version >= 4) {
-    uint32_t count = static_cast<uint32_t>(m_relocations.size());
-    m_file.write(reinterpret_cast<const char*>(&count), sizeof(count));
-    for (const auto &e : m_relocations) {
-      m_file.write(reinterpret_cast<const char*>(&e.logicalOffset), sizeof(e.logicalOffset));
-      m_file.write(reinterpret_cast<const char*>(&e.length), sizeof(e.length));
-      m_file.write(reinterpret_cast<const char*>(&e.physicalOffset), sizeof(e.physicalOffset));
-    }
-    if (!m_file) { std::wcerr << L"Write relocation metadata failed" << std::endl; return false; }
-    m_payloadOffset += sizeof(uint32_t) + static_cast<uint64_t>(count) * (sizeof(uint64_t) * 3);
-    // v4/v5 扩展：写入填充指纹盐与占位指纹，稍后回填结果
-    randomBytes(m_padSalt, sizeof(m_padSalt));
+    // v5 扩展：写入 authBlockSize + headerHMAC 占位 + relocAuthHMACs 占位
     if (m_header.version >= 5) {
-      m_padHmac.assign(32, 0);
-      m_file.write(reinterpret_cast<const char*>(m_padSalt), sizeof(m_padSalt));
-      m_file.write(reinterpret_cast<const char*>(m_padHmac.data()), m_padHmac.size());
-      m_payloadOffset += sizeof(m_padSalt) + m_padHmac.size();
-    } else {
-      uint32_t zeroCRC = 0;
-      m_file.write(reinterpret_cast<const char*>(m_padSalt), sizeof(m_padSalt));
-      m_file.write(reinterpret_cast<const char*>(&zeroCRC), sizeof(zeroCRC));
-      m_payloadOffset += sizeof(m_padSalt) + sizeof(uint32_t);
+      m_file.write(reinterpret_cast<const char*>(&m_header.authBlockSize), sizeof(m_header.authBlockSize));
+      if (!m_file) { std::wcerr << L"Write v5 authBlockSize failed" << std::endl; return false; }
+      // headerHMAC placeholder (32 bytes, backfilled later)
+      m_headerHmac.assign(32, 0);
+      m_file.write(reinterpret_cast<const char*>(m_headerHmac.data()), m_headerHmac.size());
+      if (!m_file) { std::wcerr << L"Write v5 headerHMAC placeholder failed" << std::endl; return false; }
+      // reloc auth HMAC placeholders
+      uint32_t relocAuthCount = static_cast<uint32_t>(m_relocations.size());
+      m_file.write(reinterpret_cast<const char*>(&relocAuthCount), sizeof(relocAuthCount));
+      m_relocAuthHmacs.resize(relocAuthCount, std::vector<uint8_t>(32, 0));
+      for (const auto &hmac : m_relocAuthHmacs) {
+        m_file.write(reinterpret_cast<const char*>(hmac.data()), 32);
+      }
+      if (!m_file) { std::wcerr << L"Write v5 reloc auth HMACs failed" << std::endl; return false; }
+      m_payloadOffset += sizeof(m_header.authBlockSize) + 32 + sizeof(uint32_t) + relocAuthCount * 32;
+      std::wcerr << L"[evhd] create: v5 ext written. authBlockSize=" << m_header.authBlockSize
+                 << L" payloadOffset=" << m_payloadOffset << L"\n";
     }
-    if (!m_file) { std::wcerr << L"Write pad fingerprint failed" << std::endl; return false; }
-    // 诊断：打印写入后的条目数量与负载起始偏移
-    std::wcerr << L"[evhd] create: relocCount=" << count
-               << L" payloadOffset=" << m_payloadOffset << L"\n";
-  }
-  // v5 扩展：写入 authBlockSize + headerHMAC 占位 + relocAuthHMACs 占位
-  if (m_header.version >= 5) {
-    m_file.write(reinterpret_cast<const char*>(&m_header.authBlockSize), sizeof(m_header.authBlockSize));
-    if (!m_file) { std::wcerr << L"Write v5 authBlockSize failed" << std::endl; return false; }
-    // headerHMAC placeholder (32 bytes, backfilled later)
-    m_headerHmac.assign(32, 0);
-    m_file.write(reinterpret_cast<const char*>(m_headerHmac.data()), m_headerHmac.size());
-    if (!m_file) { std::wcerr << L"Write v5 headerHMAC placeholder failed" << std::endl; return false; }
-    // reloc auth HMAC placeholders
-    uint32_t relocAuthCount = static_cast<uint32_t>(m_relocations.size());
-    m_file.write(reinterpret_cast<const char*>(&relocAuthCount), sizeof(relocAuthCount));
-    m_relocAuthHmacs.resize(relocAuthCount, std::vector<uint8_t>(32, 0));
-    for (const auto &hmac : m_relocAuthHmacs) {
-      m_file.write(reinterpret_cast<const char*>(hmac.data()), 32);
-    }
-    if (!m_file) { std::wcerr << L"Write v5 reloc auth HMACs failed" << std::endl; return false; }
-    m_payloadOffset += sizeof(m_header.authBlockSize) + 32 + sizeof(uint32_t) + relocAuthCount * 32;
-    std::wcerr << L"[evhd] create: v5 ext written. authBlockSize=" << m_header.authBlockSize
-               << L" payloadOffset=" << m_payloadOffset << L"\n";
   }
   // Ensure write pointer is at payload start
   m_file.seekp(m_payloadOffset, std::ios::beg);
@@ -775,11 +808,43 @@ bool Container::createFromPlainVhd(const std::wstring &plainVhdPath, const std::
 }
 
 bool Container::readPlain(uint64_t offset, uint8_t *buffer, size_t length) {
-  std::lock_guard<std::recursive_mutex> lg(m_mutex);
-  if (!m_ready || !buffer || length == 0) return false;
+  // Fast path: no shared_lock for reads. We use an atomic m_ready flag to detect
+  // if the container is being closed. The shared_mutex is only acquired for writes
+  // and lifecycle operations (open/close/flush).
+  if (!m_ready.load(std::memory_order_acquire) || !buffer || length == 0) return false;
   if (m_debug) {
     std::wcerr << L"[evhd] readPlain offset=" << offset << L" len=" << length << L"\n";
   }
+
+  // Fast path: if the read range doesn't overlap any relocation entry,
+  // physicalOffset == logicalOffset and we can skip mapLogicalToPhysical entirely.
+  bool hitsRelocation = false;
+  uint64_t readEnd = offset + static_cast<uint64_t>(length);
+  for (const auto &e : m_relocations) {
+    uint64_t relocEnd = e.logicalOffset + e.length;
+    if (offset < relocEnd && readEnd > e.logicalOffset) {
+      hitsRelocation = true;
+      break;
+    }
+  }
+
+  if (!hitsRelocation) {
+    // Simple case: single contiguous segment, physOffset == logicalOffset
+    if (!readRawPhys(offset, buffer, length)) {
+      if (m_debug) {
+        std::wcerr << L"[evhd] readRawPhys fail at phys=" << offset << L" len=" << length << L"\n";
+      }
+      return false;
+    }
+    if (!m_crypto.decryptRange(offset, buffer, length)) {
+      if (m_debug) {
+        std::wcerr << L"[evhd] decryptRange failed at phys=" << offset << L" len=" << length << L"\n";
+      }
+      return false;
+    }
+    return true;
+  }
+
   // 将逻辑请求映射为一个或多个物理段
   std::vector<RelocEntry> segs; mapLogicalToPhysical(offset, length, segs);
   // 合并相邻且物理/逻辑连续的段，减少 seek/read 次数
@@ -847,8 +912,108 @@ bool Container::readPlain(uint64_t offset, uint8_t *buffer, size_t length) {
   return true;
 }
 
+void Container::initBatcher() {
+  JournalBatcherIO io;
+
+  // writeJournalEntries: for each transaction in the batch, call prepareJournalTransaction
+  io.writeJournalEntries = [this](const std::vector<BatchTransaction> &transactions) -> bool {
+    // Combine all transactions into a single journal transaction
+    // (the journal supports multiple entries in one prepare call)
+    std::vector<RelocEntry> allSegments;
+    std::vector<uint8_t> allCiphertext;
+    for (const auto &txn : transactions) {
+      size_t cipherPos = 0;
+      for (const auto &seg : txn.segments) {
+        RelocEntry re{};
+        re.physicalOffset = seg.physOffset;
+        re.length = seg.length;
+        re.logicalOffset = 0; // not used by prepareJournalTransaction
+        allSegments.push_back(re);
+        cipherPos += static_cast<size_t>(seg.length);
+      }
+      allCiphertext.insert(allCiphertext.end(), txn.ciphertext.begin(), txn.ciphertext.end());
+    }
+    return prepareJournalTransaction(allSegments, allCiphertext, false);
+  };
+
+  // flushJournal: single FlushFileBuffers on journal handle.
+  // With FILE_FLAG_WRITE_THROUGH, writes are already durable so this is a no-op.
+  io.flushJournal = [this]() -> bool {
+    if (m_journalHandle == INVALID_HANDLE_VALUE) return false;
+    // FILE_FLAG_WRITE_THROUGH guarantees write durability without explicit flush.
+    // Skip FlushFileBuffers to avoid redundant ~7ms NVMe flush penalty per call.
+    return true;
+  };
+
+  // writeMainData: write encrypted data to main container for each transaction
+  io.writeMainData = [this](const std::vector<BatchTransaction> &transactions) -> bool {
+    for (const auto &txn : transactions) {
+      size_t cipherPos = 0;
+      for (const auto &seg : txn.segments) {
+        if (!writeRawPhys(seg.physOffset, txn.ciphertext.data() + cipherPos,
+                          static_cast<size_t>(seg.length))) {
+          return false;
+        }
+        // v5: update payload auth tags for this block if enabled
+        if (m_crypto.isV5() && m_header.authBlockSize > 0 && !m_payloadAuthTags.empty()) {
+          // Compute and update auth tag for each auth block touched by this segment
+          uint64_t segStart = seg.physOffset;
+          uint64_t segEnd = seg.physOffset + seg.length;
+          uint64_t blockStart = (segStart / m_header.authBlockSize) * m_header.authBlockSize;
+          while (blockStart < segEnd) {
+            uint64_t blockLen = std::min<uint64_t>(m_header.authBlockSize,
+                                                    m_header.originalSize - blockStart);
+            // Read the full block ciphertext to compute the tag
+            std::vector<uint8_t> blockCipher(static_cast<size_t>(blockLen));
+            if (readRawPhys(blockStart, blockCipher.data(), static_cast<size_t>(blockLen))) {
+              std::vector<uint8_t> tag(32);
+              if (computePayloadAuthTag(blockStart, blockCipher.data(), blockCipher.size(), tag)) {
+                uint64_t blockIndex = blockStart / m_header.authBlockSize;
+                size_t tagOffset = static_cast<size_t>(blockIndex * 32);
+                if (tagOffset + 32 <= m_payloadAuthTags.size()) {
+                  memcpy(m_payloadAuthTags.data() + tagOffset, tag.data(), 32);
+                  // Write updated tag to disk
+                  uint64_t tagsFileOffset = m_payloadAuthTagsOffset + tagOffset;
+                  writeHandleExact(m_handle, tagsFileOffset, tag.data(), 32);
+                }
+              }
+            }
+            blockStart += m_header.authBlockSize;
+          }
+        }
+        cipherPos += static_cast<size_t>(seg.length);
+      }
+    }
+    return true;
+  };
+
+  // flushMain: single FlushFileBuffers on main container handle.
+  // With FILE_FLAG_WRITE_THROUGH, writes are already durable so this is a no-op.
+  io.flushMain = [this]() -> bool {
+    if (m_handle == INVALID_HANDLE_VALUE) return false;
+    // FILE_FLAG_WRITE_THROUGH guarantees write durability without explicit flush.
+    // Skip FlushFileBuffers to avoid redundant ~7ms NVMe flush penalty per call.
+    return true;
+  };
+
+  // clearJournal: clear journal state after successful commit.
+  // We skip the flush here because the journal is already safely committed
+  // and the next batch will overwrite it anyway. This eliminates one
+  // FlushFileBuffers call per batch.
+  io.clearJournal = [this]() -> bool {
+    return clearJournalStateNoFlush();
+  };
+
+  JournalBatcherConfig config;
+  config.maxBatchBytes = 64 * 1024;  // 64 KiB
+  config.maxBatchOps = 16;           // 16 operations
+  config.timeout = std::chrono::milliseconds(1);
+
+  m_batcher = std::make_unique<JournalBatcher>(std::move(io), config);
+}
+
 bool Container::writePlain(uint64_t offset, const uint8_t *buffer, size_t length) {
-  std::lock_guard<std::recursive_mutex> lg(m_mutex);
+  std::shared_lock<std::shared_mutex> sl(m_rwMutex);
   if (!m_ready || !buffer || length == 0) return false;
   // 将逻辑写入拆分为物理段（重定位范围写入尾部）
   std::vector<RelocEntry> segs; mapLogicalToPhysical(offset, length, segs);
@@ -865,6 +1030,16 @@ bool Container::writePlain(uint64_t offset, const uint8_t *buffer, size_t length
     }
     merged.push_back(s);
   }
+
+  // Compute the overall physical range for the range lock
+  // (covers all merged segments from min physOffset to max physOffset+length)
+  uint64_t rangeStart = merged.front().physicalOffset;
+  uint64_t rangeEnd = merged.back().physicalOffset + merged.back().length;
+  uint64_t rangeLen = rangeEnd - rangeStart;
+
+  // Acquire exclusive range lock on the target physical offset range
+  // This allows non-overlapping writes to proceed concurrently
+  auto rangeLockGuard = m_rangeLock.guard(rangeStart, rangeLen, RangeLock::Mode::Exclusive);
   size_t bufPos = 0;
   std::vector<uint8_t> tmp; tmp.reserve(length);
   std::vector<uint8_t> ciphertext;
@@ -876,6 +1051,23 @@ bool Container::writePlain(uint64_t offset, const uint8_t *buffer, size_t length
     bufPos += static_cast<size_t>(s.length);
   }
 
+  // If batcher is available, submit to it for group-commit batching.
+  // Otherwise fall back to direct journal + write + flush + clear.
+  if (m_batcher) {
+    BatchTransaction txn;
+    txn.segments.reserve(merged.size());
+    for (const auto &s : merged) {
+      txn.segments.push_back({s.physicalOffset, s.length});
+    }
+    txn.ciphertext = std::move(ciphertext);
+    if (!m_batcher->submit(std::move(txn))) {
+      m_ready = false;
+      return false;
+    }
+    return true;
+  }
+
+  // Fallback: direct write path (no journal or batcher not available)
   if (!prepareJournalTransaction(merged, ciphertext)) {
     m_ready = false;
     return false;
@@ -890,7 +1082,7 @@ bool Container::writePlain(uint64_t offset, const uint8_t *buffer, size_t length
     cipherPos += static_cast<size_t>(s.length);
   }
 
-  if (!flush()) {
+  if (!flushInternal()) {
     m_ready = false;
     return false;
   }
@@ -1006,7 +1198,7 @@ bool Container::readHeader() {
 }
 
 bool Container::writeHeader() {
-  std::lock_guard<std::recursive_mutex> lg(m_mutex);
+  // Note: caller must hold m_rwMutex (exclusive lock)
   // 规范化写入：按 readHeader 使用的布局逐字段写入，避免结构体填充差异
   m_file.seekp(0, std::ios::beg);
   struct HeaderV1 {
@@ -1102,8 +1294,25 @@ bool Container::clearJournalState(bool dirtyFlag) {
   return writeJournalHeader(true, true);
 }
 
+// No-flush variant for the JournalBatcher: clears journal state in memory
+// and writes the header to disk but skips FlushFileBuffers.
+// The dirty flag is kept set so that ensureJournalDirty() won't flush on the
+// next prepareJournalTransaction call (the batcher's flushJournal callback
+// handles durability).
+bool Container::clearJournalStateNoFlush() {
+  if (m_journalHandle == INVALID_HANDLE_VALUE) return false;
+  m_journal.state = JOURNAL_STATE_CLEAN;
+  m_journal.dirty = 1u;  // keep dirty so ensureJournalDirty() is a no-op
+  m_journal.entryCount = 0;
+  m_journal.dataSize = 0;
+  m_journal.entriesCRC32 = 0;
+  m_journal.dataCRC32 = 0;
+  return writeJournalHeader(false, true);  // write header but don't flush
+}
+
 bool Container::prepareJournalTransaction(const std::vector<RelocEntry> &segments,
-                                         const std::vector<uint8_t> &ciphertext) {
+                                         const std::vector<uint8_t> &ciphertext,
+                                         bool flushAfter) {
   if (m_journalHandle == INVALID_HANDLE_VALUE) return false;
   if (!ensureJournalDirty()) return false;
 
@@ -1173,6 +1382,7 @@ bool Container::prepareJournalTransaction(const std::vector<RelocEntry> &segment
   } else {
     if (!resizeHandle(m_journalHandle, totalDataSize)) return false;
   }
+  if (!flushAfter) return true;
   return !!FlushFileBuffers(m_journalHandle);
 }
 
@@ -1181,6 +1391,8 @@ bool Container::recoverPendingJournal() {
   if (m_journal.state != JOURNAL_STATE_PREPARED || m_journal.entryCount == 0) {
     return true;
   }
+
+  evhd_vmp::Scope scope("journal_recover", evhd_vmp::Mode::Virtualization);
 
   const uint64_t entriesOffset = sizeof(m_journal);
   const uint64_t dataOffsetBase = entriesOffset + static_cast<uint64_t>(m_journal.entryCount) * sizeof(JournalEntryState);
@@ -1239,7 +1451,7 @@ bool Container::recoverPendingJournal() {
       return false;
     }
   }
-  if (!flush()) return false;
+  if (!flushInternal()) return false;
   return clearJournalState(false);
 }
 
@@ -1283,7 +1495,15 @@ void Container::closeJournal(bool cleanShutdown) {
 }
 
 bool Container::flush() {
-  std::lock_guard<std::recursive_mutex> lg(m_mutex);
+  std::unique_lock<std::shared_mutex> ul(m_rwMutex);
+  // Commit any pending batched writes before flushing file handles
+  if (m_batcher) {
+    if (!m_batcher->commitNow()) return false;
+  }
+  return flushInternal();
+}
+
+bool Container::flushInternal() {
   bool ok = true;
   if (m_file.is_open()) {
     m_file.flush();
@@ -1299,9 +1519,28 @@ bool Container::flush() {
 }
 
 void Container::close() {
-  std::lock_guard<std::recursive_mutex> lg(m_mutex);
+  std::unique_lock<std::shared_mutex> ul(m_rwMutex);
+  closeInternal();
+}
+
+void Container::closeInternal() {
   bool cleanShutdown = (m_journalHandle != INVALID_HANDLE_VALUE && m_journal.state == JOURNAL_STATE_CLEAN);
   m_ready = false;
+  // Stop the batcher first — flushes any pending writes before closing handles
+  if (m_batcher) {
+    m_batcher->stop();
+    m_batcher.reset();
+  }
+  // Unmap memory-mapped view before closing handles
+  if (m_mappedView) {
+    UnmapViewOfFile(m_mappedView);
+    m_mappedView = nullptr;
+    m_mappedSize = 0;
+  }
+  if (m_mappingHandle) {
+    CloseHandle(m_mappingHandle);
+    m_mappingHandle = nullptr;
+  }
   if (m_handle != INVALID_HANDLE_VALUE) {
     FlushFileBuffers(m_handle);
   }
@@ -1355,6 +1594,9 @@ bool Container::verifyIntegrity() {
     // v1-v3 不包含剪切填充指纹，视为跳过校验
     return true;
   }
+
+  evhd_vmp::Scope scope("container_verifyIntegrity", evhd_vmp::Mode::Virtualization);
+
   // 诊断输出基础信息
   if (m_debug) {
     std::wcerr << L"[evhd] integrity: payloadOffset=" << m_payloadOffset
@@ -1441,13 +1683,23 @@ bool Container::verifyIntegrity() {
 bool Container::readRawPhys(uint64_t physOffset, uint8_t *dst, size_t len) {
   if (m_handle == INVALID_HANDLE_VALUE) return false;
   ULONGLONG abs = m_payloadOffset + physOffset;
+
+  // Fast path: use memory-mapped I/O if available (zero kernel transitions).
+  if (m_mappedView && abs + len <= m_mappedSize) {
+    memcpy(dst, m_mappedView + abs, len);
+    return true;
+  }
+
+  // Thread-local event handle: created once per thread, reused across calls.
+  // Manual-reset event (bManualReset=TRUE) is required for overlapped I/O.
+  static thread_local HANDLE tlsEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (!tlsEvent) return false;
   if (!m_unbuffered) {
+    ResetEvent(tlsEvent);
     OVERLAPPED ov{};
     ov.Offset     = static_cast<DWORD>(abs & 0xFFFFFFFFULL);
     ov.OffsetHigh = static_cast<DWORD>(abs >> 32);
-    HANDLE hEvt = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!hEvt) return false;
-    ov.hEvent = hEvt;
+    ov.hEvent = tlsEvent;
     DWORD want = static_cast<DWORD>(len);
     DWORD done = 0;
     BOOL ok = ReadFile(m_handle, dst, want, nullptr, &ov);
@@ -1456,13 +1708,11 @@ bool Container::readRawPhys(uint64_t physOffset, uint8_t *dst, size_t len) {
       if (err == ERROR_IO_PENDING) {
         ok = GetOverlappedResult(m_handle, &ov, &done, TRUE);
       } else {
-        CloseHandle(hEvt);
         return false;
       }
     } else {
       done = want; // synchronous path
     }
-    CloseHandle(hEvt);
     return ok && done == want;
   } else {
     const uint64_t ss = m_sectorSize;
@@ -1481,7 +1731,7 @@ bool Container::readRawPhys(uint64_t physOffset, uint8_t *dst, size_t len) {
                    << L" alignedNeed=" << need << L" fileSize=" << fileSize << L"\n";
       }
       // buffered fallback using std::fstream (thread-safe via mutex)
-      std::lock_guard<std::recursive_mutex> lg(m_mutex);
+      std::lock_guard<std::mutex> lg(m_fstreamMutex);
       m_file.clear();
       m_file.seekg(static_cast<std::streamoff>(abs), std::ios::beg);
       m_file.read(reinterpret_cast<char*>(dst), static_cast<std::streamsize>(len));
@@ -1490,12 +1740,11 @@ bool Container::readRawPhys(uint64_t physOffset, uint8_t *dst, size_t len) {
 
     uint8_t *buf = (uint8_t *)_aligned_malloc(need, ss);
     if (!buf) return false;
+    ResetEvent(tlsEvent);
     OVERLAPPED ov{};
     ov.Offset     = static_cast<DWORD>(start & 0xFFFFFFFFULL);
     ov.OffsetHigh = static_cast<DWORD>(start >> 32);
-    HANDLE hEvt = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!hEvt) { _aligned_free(buf); return false; }
-    ov.hEvent = hEvt;
+    ov.hEvent = tlsEvent;
     DWORD want = static_cast<DWORD>(need);
     DWORD done = 0;
     BOOL ok = ReadFile(m_handle, buf, want, nullptr, &ov);
@@ -1508,14 +1757,12 @@ bool Container::readRawPhys(uint64_t physOffset, uint8_t *dst, size_t len) {
           std::wcerr << L"[evhd] ReadFile(unbuffered) failed. err=" << err
                      << L" start=" << start << L" want=" << want << L" ss=" << ss << L"\n";
         }
-        CloseHandle(hEvt);
         _aligned_free(buf);
         return false;
       }
     } else {
       done = want;
     }
-    CloseHandle(hEvt);
     if (!(ok && done == want)) { _aligned_free(buf); return false; }
     size_t inner = static_cast<size_t>(abs - start);
     memcpy(dst, buf + inner, len);
@@ -1527,13 +1774,16 @@ bool Container::readRawPhys(uint64_t physOffset, uint8_t *dst, size_t len) {
 bool Container::writeRawPhys(uint64_t physOffset, const uint8_t *src, size_t len) {
   if (m_handle == INVALID_HANDLE_VALUE) return false;
   ULONGLONG abs = m_payloadOffset + physOffset;
+  // Thread-local event handle: created once per thread, reused across calls.
+  // Manual-reset event (bManualReset=TRUE) is required for overlapped I/O.
+  static thread_local HANDLE tlsEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (!tlsEvent) return false;
   if (!m_unbuffered) {
+    ResetEvent(tlsEvent);
     OVERLAPPED ov{};
     ov.Offset     = static_cast<DWORD>(abs & 0xFFFFFFFFULL);
     ov.OffsetHigh = static_cast<DWORD>(abs >> 32);
-    HANDLE hEvt = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!hEvt) return false;
-    ov.hEvent = hEvt;
+    ov.hEvent = tlsEvent;
     DWORD want = static_cast<DWORD>(len);
     DWORD done = 0;
     BOOL ok = WriteFile(m_handle, src, want, nullptr, &ov);
@@ -1542,13 +1792,11 @@ bool Container::writeRawPhys(uint64_t physOffset, const uint8_t *src, size_t len
       if (err == ERROR_IO_PENDING) {
         ok = GetOverlappedResult(m_handle, &ov, &done, TRUE);
       } else {
-        CloseHandle(hEvt);
         return false;
       }
     } else {
       done = want; // synchronous path
     }
-    CloseHandle(hEvt);
     return ok && done == want;
   } else {
     const uint64_t ss = m_sectorSize;
@@ -1558,12 +1806,11 @@ bool Container::writeRawPhys(uint64_t physOffset, const uint8_t *src, size_t len
     uint8_t *buf = (uint8_t *)_aligned_malloc(need, ss);
     if (!buf) return false;
     // Read-modify-write for partial sector updates
+    ResetEvent(tlsEvent);
     OVERLAPPED ovR{};
     ovR.Offset     = static_cast<DWORD>(start & 0xFFFFFFFFULL);
     ovR.OffsetHigh = static_cast<DWORD>(start >> 32);
-    HANDLE hEvtR = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!hEvtR) { _aligned_free(buf); return false; }
-    ovR.hEvent = hEvtR;
+    ovR.hEvent = tlsEvent;
     DWORD wantR = static_cast<DWORD>(need);
     DWORD doneR = 0;
     BOOL okR = ReadFile(m_handle, buf, wantR, nullptr, &ovR);
@@ -1572,25 +1819,22 @@ bool Container::writeRawPhys(uint64_t physOffset, const uint8_t *src, size_t len
       if (err == ERROR_IO_PENDING) {
         okR = GetOverlappedResult(m_handle, &ovR, &doneR, TRUE);
       } else {
-        CloseHandle(hEvtR);
         _aligned_free(buf);
         return false;
       }
     } else {
       doneR = wantR;
     }
-    CloseHandle(hEvtR);
     if (!(okR && doneR == wantR)) { _aligned_free(buf); return false; }
 
     size_t inner = static_cast<size_t>(abs - start);
     memcpy(buf + inner, src, len);
 
+    ResetEvent(tlsEvent);
     OVERLAPPED ovW{};
     ovW.Offset     = static_cast<DWORD>(start & 0xFFFFFFFFULL);
     ovW.OffsetHigh = static_cast<DWORD>(start >> 32);
-    HANDLE hEvtW = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!hEvtW) { _aligned_free(buf); return false; }
-    ovW.hEvent = hEvtW;
+    ovW.hEvent = tlsEvent;
     DWORD wantW = static_cast<DWORD>(need);
     DWORD doneW = 0;
     BOOL okW = WriteFile(m_handle, buf, wantW, nullptr, &ovW);
@@ -1599,14 +1843,12 @@ bool Container::writeRawPhys(uint64_t physOffset, const uint8_t *src, size_t len
       if (err == ERROR_IO_PENDING) {
         okW = GetOverlappedResult(m_handle, &ovW, &doneW, TRUE);
       } else {
-        CloseHandle(hEvtW);
         _aligned_free(buf);
         return false;
       }
     } else {
       doneW = wantW;
     }
-    CloseHandle(hEvtW);
     _aligned_free(buf);
     return okW && doneW == wantW;
   }

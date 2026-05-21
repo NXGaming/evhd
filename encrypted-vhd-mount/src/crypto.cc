@@ -2,6 +2,8 @@
 
 #include "crypto.h"
 
+#include "vmprotect_scope.h"
+
 #include <stdexcept>
 #include <cstring>
 #include <iostream>
@@ -57,21 +59,25 @@ bool CryptoContext::init(const std::wstring &password, const Params &params) {
     std::cerr << "deriveKey failed" << std::endl; return false;
   }
 
-  // Allocate key object buffer (must persist for key lifetime)
-  DWORD objLen = 0;
-  DWORD cbRes = 0;
-  status = BCryptGetProperty(m_aesAlg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&objLen, sizeof(objLen), &cbRes, 0);
-  if (status != 0) { std::cerr << "Get OBJECT_LENGTH failed: 0x" << std::hex << status << std::dec << std::endl; return false; }
-  m_keyObject.assign(objLen, 0);
+  {
+    evhd_vmp::Scope scope("crypto_init", evhd_vmp::Mode::Mutation);
 
-  status = BCryptGenerateSymmetricKey(m_aesAlg, &m_aesKey, m_keyObject.data(), (ULONG)m_keyObject.size(),
-                                      (PUCHAR)m_key.data(), (ULONG)m_key.size(), 0);
-  if (status != 0) { std::cerr << "GenerateSymmetricKey failed: 0x" << std::hex << status << std::dec << std::endl; return false; }
+    // Allocate key object buffer (must persist for key lifetime)
+    DWORD objLen = 0;
+    DWORD cbRes = 0;
+    status = BCryptGetProperty(m_aesAlg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&objLen, sizeof(objLen), &cbRes, 0);
+    if (status != 0) { std::cerr << "Get OBJECT_LENGTH failed: 0x" << std::hex << status << std::dec << std::endl; return false; }
+    m_keyObject.assign(objLen, 0);
 
-  // Set chaining mode to ECB on the key, CTR is implemented manually
-  status = BCryptSetProperty(m_aesKey, BCRYPT_CHAINING_MODE, (PUCHAR)BCRYPT_CHAIN_MODE_ECB,
-                             (ULONG)sizeof(BCRYPT_CHAIN_MODE_ECB), 0);
-  if (status != 0) { std::cerr << "Set CHAINING_MODE ECB failed: 0x" << std::hex << status << std::dec << std::endl; return false; }
+    status = BCryptGenerateSymmetricKey(m_aesAlg, &m_aesKey, m_keyObject.data(), (ULONG)m_keyObject.size(),
+                                        (PUCHAR)m_key.data(), (ULONG)m_key.size(), 0);
+    if (status != 0) { std::cerr << "GenerateSymmetricKey failed: 0x" << std::hex << status << std::dec << std::endl; return false; }
+
+    // Set chaining mode to ECB on the key, CTR is implemented manually
+    status = BCryptSetProperty(m_aesKey, BCRYPT_CHAINING_MODE, (PUCHAR)BCRYPT_CHAIN_MODE_ECB,
+                               (ULONG)sizeof(BCRYPT_CHAIN_MODE_ECB), 0);
+    if (status != 0) { std::cerr << "Set CHAINING_MODE ECB failed: 0x" << std::hex << status << std::dec << std::endl; return false; }
+  }
 
   m_ready = true;
   return true;
@@ -141,26 +147,37 @@ bool CryptoContext::initV5(const std::wstring &password, const Params &params) {
   // First do standard init to derive masterKey -> m_key
   if (!init(password, params)) return false;
 
-  // Derive hmacKey = HMAC-SHA256(masterKey, "hmac-auth-v5" || nonce)
-  std::vector<uint8_t> prk = m_key; // masterKey reused as PRK
-  const char label[] = "hmac-auth-v5";
-  std::vector<uint8_t> info;
-  info.insert(info.end(), reinterpret_cast<const uint8_t*>(label),
-              reinterpret_cast<const uint8_t*>(label) + sizeof(label) - 1);
-  info.insert(info.end(), params.nonce.begin(), params.nonce.end());
+  {
+    evhd_vmp::Scope scope("crypto_initV5", evhd_vmp::Mode::Mutation);
 
-  m_hmacKey.resize(32);
-  if (!hmacSha256(prk, info, m_hmacKey)) {
-    SecureZeroMemory(m_hmacKey.data(), m_hmacKey.size());
-    m_hmacKey.clear();
-    return false;
+    // Derive hmacKey = HMAC-SHA256(masterKey, "hmac-auth-v5" || nonce)
+    std::vector<uint8_t> prk = m_key; // masterKey reused as PRK
+    const char label[] = "hmac-auth-v5";
+    std::vector<uint8_t> info;
+    info.insert(info.end(), reinterpret_cast<const uint8_t*>(label),
+                reinterpret_cast<const uint8_t*>(label) + sizeof(label) - 1);
+    info.insert(info.end(), params.nonce.begin(), params.nonce.end());
+
+    m_hmacKey.resize(32);
+    if (!hmacSha256(prk, info, m_hmacKey)) {
+      SecureZeroMemory(m_hmacKey.data(), m_hmacKey.size());
+      m_hmacKey.clear();
+      return false;
+    }
+
+    if (!prk.empty()) {
+      SecureZeroMemory(prk.data(), prk.size());
+    }
   }
+
   m_v5 = true;
   return true;
 }
 
 bool CryptoContext::deriveKey(const std::wstring &password, const Params &params,
                               std::vector<uint8_t> &keyOut) {
+  evhd_vmp::Scope scope("crypto_deriveKey", evhd_vmp::Mode::Virtualization);
+
   // Common: open PBKDF2 provider (HMAC-SHA256)
   BCRYPT_ALG_HANDLE hPbkdf = nullptr;
   NTSTATUS status = BCryptOpenAlgorithmProvider(&hPbkdf, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG);
@@ -266,8 +283,11 @@ bool CryptoContext::aesCtrCrypt(uint64_t fileOffset, uint8_t *buffer, size_t len
 
   // 每批次最多生成的块数（64KB keystream）
   const size_t maxBlocksPerBatch = 4096; // 4096 * 16 = 65536 bytes
-  std::vector<uint8_t> ivs; ivs.reserve(maxBlocksPerBatch * 16);
-  std::vector<uint8_t> ks;  ks.reserve(maxBlocksPerBatch * 16);
+  // Thread-local buffers to avoid heap allocation on every call.
+  static thread_local std::vector<uint8_t> ivs;
+  static thread_local std::vector<uint8_t> ks;
+  ivs.reserve(maxBlocksPerBatch * 16);
+  ks.reserve(maxBlocksPerBatch * 16);
 
   while (processed < length) {
     size_t remaining = length - processed;

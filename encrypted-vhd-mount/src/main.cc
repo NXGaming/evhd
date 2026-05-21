@@ -13,6 +13,7 @@
 #include <vector>
 #include <vector>
 
+#include "vmprotect_scope.h"
 #include "vfs_evhd.h"
 
 struct Parameters {
@@ -113,6 +114,8 @@ static bool ensureDokanLoaded() {
 }
 
 static bool readParameters(Parameters &params, int argc, wchar_t **argv) {
+  evhd_vmp::Scope scope("startup_readParameters", evhd_vmp::Mode::Mutation);
+
   bool usedPasswordArg = false;
   for (int i = 1; i < argc; ++i) {
     std::wstring arg = argv[i];
@@ -178,6 +181,26 @@ static bool readParameters(Parameters &params, int argc, wchar_t **argv) {
   return true;
 }
 
+static bool runStartupProtectionChecks() {
+  evhd_vmp::Scope scope("startup_protection_checks", evhd_vmp::Mode::Mutation);
+
+  if (!evhd_vmp::isProtected()) {
+    return true;
+  }
+
+  if (!evhd_vmp::isValidImageCRC()) {
+    std::wcout << L"[main] Image integrity check failed\n";
+    return false;
+  }
+
+  if (evhd_vmp::isDebuggerPresent(true)) {
+    std::wcout << L"[main] Debugger detected\n";
+    return false;
+  }
+
+  return true;
+}
+
 static bool isRedirectedHandle(HANDLE handle) {
   if (handle == INVALID_HANDLE_VALUE || handle == nullptr) {
     return false;
@@ -238,6 +261,11 @@ int wmain(int argc, wchar_t **argv) {
   if (!readParameters(params, argc, argv)) {
     if (!params.password.empty()) SecureZeroMemory(params.password.data(), params.password.size() * sizeof(wchar_t));
     return 0;
+  }
+
+  if (!runStartupProtectionChecks()) {
+    if (!params.password.empty()) SecureZeroMemory(params.password.data(), params.password.size() * sizeof(wchar_t));
+    return 1;
   }
 
   std::wcout << L"[main] args parsed. debug=" << (params.debugMode ? L"on" : L"off")
