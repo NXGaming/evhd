@@ -60,7 +60,7 @@ bool CryptoContext::init(const std::wstring &password, const Params &params) {
   }
 
   {
-    evhd_vmp::Scope scope("crypto_init", evhd_vmp::Mode::Mutation);
+    evhd_vmp::Scope scope("crypto_init", evhd_vmp::Mode::Virtualization);
 
     // Allocate key object buffer (must persist for key lifetime)
     DWORD objLen = 0;
@@ -148,7 +148,7 @@ bool CryptoContext::initV5(const std::wstring &password, const Params &params) {
   if (!init(password, params)) return false;
 
   {
-    evhd_vmp::Scope scope("crypto_initV5", evhd_vmp::Mode::Mutation);
+    evhd_vmp::Scope scope("crypto_initV5", evhd_vmp::Mode::Virtualization);
 
     // Derive hmacKey = HMAC-SHA256(masterKey, "hmac-auth-v5" || nonce)
     std::vector<uint8_t> prk = m_key; // masterKey reused as PRK

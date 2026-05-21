@@ -10,14 +10,76 @@
 
 ## 构建
 
+### 基本构建（不含 VMProtect）
+
 ```powershell
-mkdir encrypted-vhd-mount\build
-cd encrypted-vhd-mount\build
-cmake .. -G "Visual Studio 17 2022" -A x64
+mkdir build
+cd build
+cmake ../encrypted-vhd-mount -G Ninja -DEVHD_ENABLE_VMPROTECT=OFF
 cmake --build . --config Release
 ```
 
-CMake 配置共生成三个目标：
+### Release 构建（含 VMProtect 标记）
+
+Release 版本需要 VMProtect SDK 头文件和 lib，用于在关键函数中嵌入保护标记。编译产物需要再经过 VMProtect 工具加壳才能获得实际保护。
+
+#### 1. 放置 VMProtect SDK 文件
+
+将 VMProtect SDK 中的以下文件放到 `encrypted-vhd-mount/third_party/VMProtect/` 目录：
+
+```
+encrypted-vhd-mount/
+└── third_party/
+    └── VMProtect/
+        ├── VMProtectSDK.h        ← SDK 头文件（必需）
+        ├── VMProtectSDK64.lib    ← 64 位静态库（必需）
+        └── VMProtectSDK32.lib    ← 32 位静态库（可选）
+```
+
+这些文件来自 VMProtect 安装目录的 `Include/` 和 `Lib/` 子目录。**不要**将它们提交到 git（已在 .gitignore 中排除）。
+
+#### 2. 编译
+
+```powershell
+mkdir build
+cd build
+cmake ../encrypted-vhd-mount -G Ninja -DEVHD_ENABLE_VMPROTECT=ON
+cmake --build . --config Release
+```
+
+编译成功后会生成：
+- `encrypted-vhd-mount.exe` — 含 VMP 标记的主程序
+- `encrypted-vhd-mount.pdb` — 符号文件（VMProtect 加壳时需要）
+
+> CMake 已配置 Release 模式生成 PDB（`/Zi` + `/DEBUG /OPT:REF /OPT:ICF`），确保 VMProtect 能通过 PDB 定位标记函数。
+
+#### 3. VMProtect 加壳
+
+1. 打开 VMProtect，加载 `build/encrypted-vhd-mount.exe`
+2. VMProtect 会自动通过 PDB 识别代码中的 `VMProtectBegin*` / `VMProtectEnd` 标记
+3. 当前标记的函数及保护模式：
+
+| 标记名 | 模式 | 保护内容 |
+|--------|------|----------|
+| `crypto_deriveKey` | Virtualization | PBKDF2 密钥派生（最核心） |
+| `crypto_init` | Virtualization | AES 密钥对象创建 |
+| `crypto_initV5` | Virtualization | v5 HMAC 密钥派生 |
+| `container_verifyIntegrity` | Virtualization | 容器完整性校验 |
+| `journal_recover` | Virtualization | Journal 崩溃恢复 |
+| `startup_protection_checks` | Virtualization | 反调试 / CRC 检查 |
+| `startup_readParameters` | Mutation | 命令行参数解析 |
+| `container_create_layout` | Mutation | 容器创建布局 |
+
+4. 确认 exe 和 pdb 时间戳一致（若报"MAP/PDB 文件具有不正确的时间戳"，需 clean rebuild）
+5. 编译输出 `.vmp.exe`
+
+#### 4. 不含 VMProtect 的构建
+
+如果没有 VMProtect SDK 或设置 `-DEVHD_ENABLE_VMPROTECT=OFF`，所有 `evhd_vmp::Scope` 调用会编译为空操作（零开销），程序功能完全不受影响，只是没有代码保护。
+
+### 构建目标说明
+
+CMake 配置共生成以下目标：
 
 - `encrypted-vhd-mount.exe`：CLI 主程序，负责创建（`/init`）与挂载（Dokan）。
 - `evhd-bench.exe`：脱离 Dokan 直接对 `Container` 进行顺序/随机读基准。
@@ -215,4 +277,4 @@ diskspd -b4K -d30 -o32 -t4 -w100 -Sh -Su -c4G M:\benchfile.dat
 - 当前不支持扩展VHD大小（写入超过原始大小将被拒绝）。
 - 建议使用足够强度的密码，并妥善备份密钥材料（密码与密钥文件）。一旦遗失或泄露，数据安全不可保证且不可恢复。
 - 密钥文件建议使用随机二进制内容，并与密文分开存放；组合方式（密码+密钥文件）可降低单点泄露风险。
-- 读写并发已通过文件级互斥保护；如需高并发可进一步引入分块锁策略。
+- 读写并发已通过 shared_mutex + RangeLock 实现细粒度并发控制：不重叠的读完全并行，不重叠的写也可并行执行。

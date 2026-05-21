@@ -8,6 +8,9 @@ if (MSVC)
   cmake_policy(SET CMP0091 NEW)
   # Release 使用 /MT，Debug 使用 /MTd
   set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+  # Release 也生成 PDB（VMProtect 需要 PDB 来定位标记）
+  set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /Zi")
+  set(CMAKE_EXE_LINKER_FLAGS_RELEASE "${CMAKE_EXE_LINKER_FLAGS_RELEASE} /DEBUG /OPT:REF /OPT:ICF")
 endif()
 
 set(SOURCE_ROOT "${CMAKE_CURRENT_LIST_DIR}/src")

@@ -160,10 +160,6 @@ private:
   uint64_t m_payloadAuthTagsOffset{0}; // absolute file offset of auth tags
   bool m_unbuffered{false};
   uint32_t m_sectorSize{4096};
-  // Memory-mapped I/O for fast reads (buffered mode only)
-  HANDLE m_mappingHandle{nullptr};
-  const uint8_t *m_mappedView{nullptr};
-  uint64_t m_mappedSize{0};
   // JournalBatcher for group-commit write batching
   std::unique_ptr<JournalBatcher> m_batcher;
   void initBatcher();

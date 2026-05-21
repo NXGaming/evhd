@@ -92,15 +92,16 @@ constexpr uint32_t JOURNAL_STATE_CLEAN = 0;
 constexpr uint32_t JOURNAL_STATE_PREPARED = 1;
 
 static bool readHandleExact(HANDLE handle, uint64_t offset, void *buffer, size_t len) {
+  static thread_local HANDLE tlsEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (!tlsEvent) return false;
   size_t doneTotal = 0;
   while (doneTotal < len) {
     DWORD want = static_cast<DWORD>(std::min<size_t>(len - doneTotal, 1u << 20));
+    ResetEvent(tlsEvent);
     OVERLAPPED ov{};
     ov.Offset     = static_cast<DWORD>((offset + doneTotal) & 0xFFFFFFFFULL);
     ov.OffsetHigh = static_cast<DWORD>((offset + doneTotal) >> 32);
-    HANDLE hEvt = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!hEvt) return false;
-    ov.hEvent = hEvt;
+    ov.hEvent = tlsEvent;
     DWORD done = 0;
     BOOL ok = ReadFile(handle, static_cast<uint8_t *>(buffer) + doneTotal, want, nullptr, &ov);
     if (!ok) {
@@ -108,13 +109,11 @@ static bool readHandleExact(HANDLE handle, uint64_t offset, void *buffer, size_t
       if (err == ERROR_IO_PENDING) {
         ok = GetOverlappedResult(handle, &ov, &done, TRUE);
       } else {
-        CloseHandle(hEvt);
         return false;
       }
     } else {
       done = want;
     }
-    CloseHandle(hEvt);
     if (!ok || done != want) return false;
     doneTotal += done;
   }
@@ -122,15 +121,16 @@ static bool readHandleExact(HANDLE handle, uint64_t offset, void *buffer, size_t
 }
 
 static bool writeHandleExact(HANDLE handle, uint64_t offset, const void *buffer, size_t len) {
+  static thread_local HANDLE tlsEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (!tlsEvent) return false;
   size_t doneTotal = 0;
   while (doneTotal < len) {
     DWORD want = static_cast<DWORD>(std::min<size_t>(len - doneTotal, 1u << 20));
+    ResetEvent(tlsEvent);
     OVERLAPPED ov{};
     ov.Offset     = static_cast<DWORD>((offset + doneTotal) & 0xFFFFFFFFULL);
     ov.OffsetHigh = static_cast<DWORD>((offset + doneTotal) >> 32);
-    HANDLE hEvt = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!hEvt) return false;
-    ov.hEvent = hEvt;
+    ov.hEvent = tlsEvent;
     DWORD done = 0;
     BOOL ok = WriteFile(handle, static_cast<const uint8_t *>(buffer) + doneTotal, want, nullptr, &ov);
     if (!ok) {
@@ -138,13 +138,11 @@ static bool writeHandleExact(HANDLE handle, uint64_t offset, const void *buffer,
       if (err == ERROR_IO_PENDING) {
         ok = GetOverlappedResult(handle, &ov, &done, TRUE);
       } else {
-        CloseHandle(hEvt);
         return false;
       }
     } else {
       done = want;
     }
-    CloseHandle(hEvt);
     if (!ok || done != want) return false;
     doneTotal += done;
   }
@@ -322,24 +320,6 @@ bool Container::openEncrypted(const std::wstring &path, const std::wstring &pass
   m_ready = true;
 
   // Create memory mapping for fast reads (buffered mode only).
-  // This eliminates kernel transitions for read I/O by mapping the file directly.
-  if (!m_unbuffered && m_handle != INVALID_HANDLE_VALUE) {
-    LARGE_INTEGER fileSize{};
-    if (GetFileSizeEx(m_handle, &fileSize) && fileSize.QuadPart > 0) {
-      m_mappingHandle = CreateFileMappingW(m_handle, nullptr, PAGE_READWRITE, 0, 0, nullptr);
-      if (m_mappingHandle) {
-        m_mappedView = static_cast<const uint8_t*>(
-            MapViewOfFile(m_mappingHandle, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0));
-        if (m_mappedView) {
-          m_mappedSize = static_cast<uint64_t>(fileSize.QuadPart);
-        } else {
-          CloseHandle(m_mappingHandle);
-          m_mappingHandle = nullptr;
-        }
-      }
-    }
-  }
-
   // Initialize the JournalBatcher for group-commit write batching
   // (only if journal is available — v4+ containers with successful journal init)
   if (m_journalHandle != INVALID_HANDLE_VALUE) {
@@ -954,29 +934,41 @@ void Container::initBatcher() {
                           static_cast<size_t>(seg.length))) {
           return false;
         }
-        // v5: update payload auth tags for this block if enabled
+        // v5: update payload auth tags if enabled.
+        // Use the ciphertext we just wrote (already in txn.ciphertext) to compute
+        // the tag — no need to read back from disk.
         if (m_crypto.isV5() && m_header.authBlockSize > 0 && !m_payloadAuthTags.empty()) {
-          // Compute and update auth tag for each auth block touched by this segment
           uint64_t segStart = seg.physOffset;
           uint64_t segEnd = seg.physOffset + seg.length;
           uint64_t blockStart = (segStart / m_header.authBlockSize) * m_header.authBlockSize;
           while (blockStart < segEnd) {
+            uint64_t blockIndex = blockStart / m_header.authBlockSize;
+            size_t tagOffset = static_cast<size_t>(blockIndex * 32);
+            if (tagOffset + 32 > m_payloadAuthTags.size()) break;
+
+            // If this write covers the entire auth block, use the ciphertext directly.
+            // Otherwise we must read the full block from disk.
             uint64_t blockLen = std::min<uint64_t>(m_header.authBlockSize,
                                                     m_header.originalSize - blockStart);
-            // Read the full block ciphertext to compute the tag
-            std::vector<uint8_t> blockCipher(static_cast<size_t>(blockLen));
-            if (readRawPhys(blockStart, blockCipher.data(), static_cast<size_t>(blockLen))) {
-              std::vector<uint8_t> tag(32);
-              if (computePayloadAuthTag(blockStart, blockCipher.data(), blockCipher.size(), tag)) {
-                uint64_t blockIndex = blockStart / m_header.authBlockSize;
-                size_t tagOffset = static_cast<size_t>(blockIndex * 32);
-                if (tagOffset + 32 <= m_payloadAuthTags.size()) {
-                  memcpy(m_payloadAuthTags.data() + tagOffset, tag.data(), 32);
-                  // Write updated tag to disk
-                  uint64_t tagsFileOffset = m_payloadAuthTagsOffset + tagOffset;
-                  writeHandleExact(m_handle, tagsFileOffset, tag.data(), 32);
-                }
-              }
+            const uint8_t *blockData = nullptr;
+            std::vector<uint8_t> blockBuf;
+
+            if (blockStart >= segStart && blockStart + blockLen <= segEnd) {
+              // Fast path: the written ciphertext fully covers this auth block
+              size_t offsetInCipher = static_cast<size_t>(blockStart - segStart);
+              blockData = txn.ciphertext.data() + cipherPos + offsetInCipher;
+            } else {
+              // Slow path: partial overlap, must read full block from disk
+              blockBuf.resize(static_cast<size_t>(blockLen));
+              if (!readRawPhys(blockStart, blockBuf.data(), blockBuf.size())) break;
+              blockData = blockBuf.data();
+            }
+
+            std::vector<uint8_t> tag(32);
+            if (computePayloadAuthTag(blockStart, blockData, static_cast<size_t>(blockLen), tag)) {
+              memcpy(m_payloadAuthTags.data() + tagOffset, tag.data(), 32);
+              uint64_t tagsFileOffset = m_payloadAuthTagsOffset + tagOffset;
+              writeHandleExact(m_handle, tagsFileOffset, tag.data(), 32);
             }
             blockStart += m_header.authBlockSize;
           }
@@ -1307,7 +1299,7 @@ bool Container::clearJournalStateNoFlush() {
   m_journal.dataSize = 0;
   m_journal.entriesCRC32 = 0;
   m_journal.dataCRC32 = 0;
-  return writeJournalHeader(false, true);  // write header but don't flush
+  return writeJournalHeader(false, false);  // no flush, no trim — next prepare overwrites
 }
 
 bool Container::prepareJournalTransaction(const std::vector<RelocEntry> &segments,
@@ -1531,16 +1523,6 @@ void Container::closeInternal() {
     m_batcher->stop();
     m_batcher.reset();
   }
-  // Unmap memory-mapped view before closing handles
-  if (m_mappedView) {
-    UnmapViewOfFile(m_mappedView);
-    m_mappedView = nullptr;
-    m_mappedSize = 0;
-  }
-  if (m_mappingHandle) {
-    CloseHandle(m_mappingHandle);
-    m_mappingHandle = nullptr;
-  }
   if (m_handle != INVALID_HANDLE_VALUE) {
     FlushFileBuffers(m_handle);
   }
@@ -1683,12 +1665,6 @@ bool Container::verifyIntegrity() {
 bool Container::readRawPhys(uint64_t physOffset, uint8_t *dst, size_t len) {
   if (m_handle == INVALID_HANDLE_VALUE) return false;
   ULONGLONG abs = m_payloadOffset + physOffset;
-
-  // Fast path: use memory-mapped I/O if available (zero kernel transitions).
-  if (m_mappedView && abs + len <= m_mappedSize) {
-    memcpy(dst, m_mappedView + abs, len);
-    return true;
-  }
 
   // Thread-local event handle: created once per thread, reused across calls.
   // Manual-reset event (bManualReset=TRUE) is required for overlapped I/O.

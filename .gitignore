@@ -24,10 +24,12 @@ build_ninja/
 
 # Third-party dependencies (local modifications should not be committed)
 third_party/
+# But track Dokan headers and lib (required for build)
+!third_party/Dokan/
+!third_party/Dokan/**
 
 installer/EncryptedVHDMount-Setup.exe
 a.txt
-.gitignore
 test.vhd
 .vscode/settings.json
 .vscode/tasks.json
@@ -40,7 +42,7 @@ selftest_tmp
 SECURITY_AUDIT.md
 SECURITY_FIX_PLAN.md
 
-#VMProtect Header Files
+#VMProtect SDK files (not redistributable)
 VMProtect*
-
+!encrypted-vhd-mount/src/vmprotect_scope.h
 .kiro

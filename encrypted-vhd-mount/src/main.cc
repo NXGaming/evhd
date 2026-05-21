@@ -182,7 +182,7 @@ static bool readParameters(Parameters &params, int argc, wchar_t **argv) {
 }
 
 static bool runStartupProtectionChecks() {
-  evhd_vmp::Scope scope("startup_protection_checks", evhd_vmp::Mode::Mutation);
+  evhd_vmp::Scope scope("startup_protection_checks", evhd_vmp::Mode::Virtualization);
 
   if (!evhd_vmp::isProtected()) {
     return true;
