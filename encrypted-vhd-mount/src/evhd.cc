@@ -988,12 +988,15 @@ void Container::initBatcher() {
     return true;
   };
 
-  // clearJournal: clear journal state after successful commit.
-  // We skip the flush here because the journal is already safely committed
-  // and the next batch will overwrite it anyway. This eliminates one
-  // FlushFileBuffers call per batch.
+  // clearJournal: In the batcher path, clearing journal state after each batch
+  // is unnecessary because the next prepareJournalTransaction will overwrite the
+  // entire journal content anyway. The journal header's entryCount/dataSize fields
+  // in the next prepare will correctly reflect the new batch state.
+  // We only need to clear on shutdown (handled by Container::close → batcher::stop).
   io.clearJournal = [this]() -> bool {
-    return clearJournalStateNoFlush();
+    // No-op in hot path. Journal state is implicitly cleared by next prepare.
+    // On clean shutdown, closeInternal handles the final clear.
+    return true;
   };
 
   JournalBatcherConfig config;
@@ -1358,22 +1361,27 @@ bool Container::prepareJournalTransaction(const std::vector<RelocEntry> &segment
   const uint64_t entriesOffset = sizeof(m_journal);
   const uint64_t dataOffsetBase = entriesOffset + static_cast<uint64_t>(entries.size()) * sizeof(JournalEntryState);
   const uint64_t totalDataSize = dataOffsetBase + ciphertext.size();
-  if (!writeHandleExact(m_journalHandle, 0, &m_journal, sizeof(m_journal))) return false;
-  if (!entries.empty() && !writeHandleExact(m_journalHandle, entriesOffset, entries.data(),
-                                            entries.size() * sizeof(JournalEntryState))) {
-    return false;
-  }
-  if (!ciphertext.empty() && !writeHandleExact(m_journalHandle, dataOffsetBase, ciphertext.data(), ciphertext.size())) {
-    return false;
-  }
-  // v5: append HMACs at the end of journal file
+  // Build a single contiguous buffer for the entire journal write to minimize
+  // the number of synchronous write-through I/O operations.
+  uint64_t journalFileSize = totalDataSize;
   if (m_crypto.isV5()) {
-    if (!writeHandleExact(m_journalHandle, totalDataSize, entriesHmac.data(), entriesHmac.size())) return false;
-    if (!writeHandleExact(m_journalHandle, totalDataSize + entriesHmac.size(), dataHmac.data(), dataHmac.size())) return false;
-    if (!resizeHandle(m_journalHandle, totalDataSize + entriesHmac.size() + dataHmac.size())) return false;
-  } else {
-    if (!resizeHandle(m_journalHandle, totalDataSize)) return false;
+    journalFileSize = totalDataSize + entriesHmac.size() + dataHmac.size();
   }
+  std::vector<uint8_t> journalBuf(static_cast<size_t>(journalFileSize));
+  memcpy(journalBuf.data(), &m_journal, sizeof(m_journal));
+  if (!entries.empty()) {
+    memcpy(journalBuf.data() + entriesOffset, entries.data(),
+           entries.size() * sizeof(JournalEntryState));
+  }
+  if (!ciphertext.empty()) {
+    memcpy(journalBuf.data() + dataOffsetBase, ciphertext.data(), ciphertext.size());
+  }
+  if (m_crypto.isV5()) {
+    memcpy(journalBuf.data() + totalDataSize, entriesHmac.data(), entriesHmac.size());
+    memcpy(journalBuf.data() + totalDataSize + entriesHmac.size(), dataHmac.data(), dataHmac.size());
+  }
+  // Single write for the entire journal content
+  if (!writeHandleExact(m_journalHandle, 0, journalBuf.data(), journalBuf.size())) return false;
   if (!flushAfter) return true;
   return !!FlushFileBuffers(m_journalHandle);
 }
@@ -1516,13 +1524,19 @@ void Container::close() {
 }
 
 void Container::closeInternal() {
-  bool cleanShutdown = (m_journalHandle != INVALID_HANDLE_VALUE && m_journal.state == JOURNAL_STATE_CLEAN);
   m_ready = false;
   // Stop the batcher first — flushes any pending writes before closing handles
   if (m_batcher) {
     m_batcher->stop();
     m_batcher.reset();
   }
+  // After batcher stop, clear journal state so next open doesn't replay
+  // a completed transaction. The batcher's clearJournal callback is a no-op
+  // for performance, so we do the final clear here.
+  if (m_journalHandle != INVALID_HANDLE_VALUE) {
+    clearJournalState(false); // dirty=false for clean shutdown
+  }
+  bool cleanShutdown = (m_journalHandle != INVALID_HANDLE_VALUE && m_journal.state == JOURNAL_STATE_CLEAN);
   if (m_handle != INVALID_HANDLE_VALUE) {
     FlushFileBuffers(m_handle);
   }

@@ -56,6 +56,7 @@ struct JournalBatcherConfig {
     size_t maxBatchBytes = 64 * 1024;   // 64 KiB threshold
     size_t maxBatchOps = 16;            // 16 operations threshold
     std::chrono::milliseconds timeout{1}; // 1 ms timeout
+    size_t maxPendingBytes = 4 * 1024 * 1024; // 4 MiB backpressure limit
 };
 
 // JournalBatcher accumulates write transactions and commits them as a group.

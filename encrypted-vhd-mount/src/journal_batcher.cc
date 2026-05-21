@@ -40,6 +40,16 @@ bool JournalBatcher::submit(BatchTransaction txn) {
         m_timerThread = std::thread(&JournalBatcher::timerLoop, this);
     }
 
+    // Backpressure: if pending data exceeds limit, wait for a commit to drain.
+    // This prevents unbounded memory growth when writes outpace disk I/O.
+    if (m_pendingBytes >= m_config.maxPendingBytes) {
+        m_timerCv.notify_one(); // wake timer to commit now
+        m_cv.wait(lock, [&] {
+            return m_pendingBytes < m_config.maxPendingBytes || !m_running.load();
+        });
+        if (!m_running.load()) return false;
+    }
+
     // Calculate the size of this transaction.
     size_t txnBytes = txn.ciphertext.size();
 
